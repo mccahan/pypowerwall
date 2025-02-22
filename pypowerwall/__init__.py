@@ -17,7 +17,7 @@
 
  Classes
     Powerwall(host, password, email, timezone, pwcacheexpire, timeout, poolmaxsize, 
-        cloudmode, siteid, authpath, authmode, cachefile, fleetapi, auto_select, retry_modes, gw_pwd)
+        cloudmode, siteid, authpath, authmode, cachefile, fleetapi, auto_select, retry_modes, gw_pwd, autoconnect)
 
  Parameters
     host                      # Hostname or IP of the Tesla gateway
@@ -38,6 +38,7 @@
     auto_select = False       # If True, select the best available mode to connect (default is False)
     retry_modes = False       # If True, retry connection to Powerwall
     gw_pwd = None             # TEG Gateway password (used for local mode access to tedapi)
+    autoconnect = True        # If True, connect to Powerwall on initialization (default is True)
     
  Functions 
     poll(api, json, force)    # Return data from Powerwall api (dict if json=True, bypass cache force=True)
@@ -130,7 +131,7 @@ class Powerwall(object):
     def __init__(self, host="", password="", email="nobody@nowhere.com",
                  timezone="America/Los_Angeles", pwcacheexpire=5, timeout=5, poolmaxsize=10,
                  cloudmode=False, siteid=None, authpath="", authmode="cookie", cachefile=".powerwall",
-                 fleetapi=False, auto_select=False, retry_modes=False, gw_pwd=None):
+                 fleetapi=False, auto_select=False, retry_modes=False, gw_pwd=None, autoconnect=True):
         """
         Represents a Tesla Energy Gateway Powerwall device.
 
@@ -152,6 +153,7 @@ class Powerwall(object):
             auto_select  = If True, select the best available mode to connect (default is False)
             retry_modes  = If True, retry connection to Powerwall
             gw_pwd       = TEG Gateway password (used for local mode access to tedapi)
+            autoconnect  = If True, connect to Powerwall on initialization (default is True)
         """
 
         # Attributes
@@ -217,10 +219,11 @@ class Powerwall(object):
         self._validate_init_configuration()
 
         # Connect to Powerwall
-        if not self.connect(self.retry_modes):
-            log.error("Unable to connect to Powerwall.")
+        if autoconnect:
+            if not self.connect(self.retry_modes):
+                log.error("Unable to connect to Powerwall.")
 
-    def connect(self, retry=False) -> bool:
+    def connect(self, retry=False, stop=None) -> bool:
         """
         Connect to Tesla Energy Gateway Powerwall
 
@@ -232,11 +235,19 @@ class Powerwall(object):
             return False
         count = 0
         while count < 3:
+            if stop is not None and callable(stop) and stop():
+                log.info("Stopping on signal")
+                return False
+            
+            log.debug("Attempt %d to connect to Powerwall" % (count + 1))
             count += 1
             if retry and count == 3:
                 log.error("Failed to connect to Powerwall with all modes. Waiting 30s to retry.")
-                time.sleep(30)
+                time.sleep(10)
                 count = 0
+            if not retry and count == 3:
+                raise ConnectionError("Failed to connect to Powerwall with all modes.")
+            
             if self.mode == "local":
                 log.debug(f"password = {self.password}, gw_pwd = {self.gw_pwd}")
                 try:

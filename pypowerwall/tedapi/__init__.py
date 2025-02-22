@@ -907,6 +907,8 @@ class TEDAPI:
             log.error(f"Unable to connect to Powerwall Gateway {self.gw_ip}")
             log.error("Please verify your your host has a route to the Gateway.")
             log.error(f"Error Details: {e}")
+
+            raise ConnectionError(f"Unable to connect to Powerwall Gateway {self.gw_ip}, please verify your host has a route to the Gateway.")
         return self.din
 
     # Handy Function to access Powerwall Status
