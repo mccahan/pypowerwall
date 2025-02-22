@@ -53,6 +53,7 @@ from urllib.parse import urlparse, parse_qs
 from transform import get_static, inject_js
 import pypowerwall
 from pypowerwall import parse_version
+import threading
 
 BUILD = "t68"
 ALLOWLIST = [
@@ -195,22 +196,35 @@ def get_value(a, key):
 
 # Connect to Powerwall
 # TODO: Add support for multiple Powerwalls
-try:
-    pw = pypowerwall.Powerwall(host, password, email, timezone, cache_expire,
-                               timeout, pool_maxsize, siteid=siteid,
-                               authpath=authpath, authmode=authmode,
-                               cachefile=cachefile, auto_select=True,
-                               retry_modes=True, gw_pwd=gw_pwd)
-except Exception as e:
-    log.error(e)
-    log.error("Fatal Error: Unable to connect. Please fix config and restart.")
-    while True:
-        try:
-            time.sleep(5)  # Infinite loop to keep container running
-        except (KeyboardInterrupt, SystemExit):
-            sys.exit(0)
+site_name = "Unknown"
+connect_error = False
+stop_threads = False
+pw = pypowerwall.Powerwall(host, password, email, timezone, cache_expire,
+                            timeout, pool_maxsize, siteid=siteid,
+                            authpath=authpath, authmode=authmode,
+                            cachefile=cachefile, auto_select=True,
+                            retry_modes=True, gw_pwd=gw_pwd, autoconnect=False)
 
-site_name = pw.site_name() or "Unknown"
+def connect_powerwall(stop):
+    global pw, site_name, connect_error
+    try:
+        pw.connect(retry=True, stop=stop)
+        site_name = pw.site_name() or "Unknown"
+    except Exception as e:
+        log.error(e)
+        log.error("Fatal Error: Unable to connect. Please fix config and restart.")
+        connect_error = str(e)
+        while True:
+            try:
+                time.sleep(5)  # Infinite loop to keep container running
+            except (KeyboardInterrupt, SystemExit):
+                sys.exit(0)
+    log.info("Connection status: %s" % pw.is_connected())
+
+# Start the connection in a background thread
+connect_thread = threading.Thread(target=connect_powerwall, args=(lambda: stop_threads,))
+connect_thread.start()
+
 if pw.cloudmode or pw.fleetapi:
     if pw.fleetapi:
         proxystats['mode'] = "FleetAPI"
@@ -247,7 +261,7 @@ if control_secret:
         else:
             pw_control = pypowerwall.Powerwall("", password, email, siteid=siteid,
                                                authpath=authpath, authmode=authmode,
-                                               cachefile=cachefile, auto_select=True)
+                                               cachefile=cachefile, auto_select=True, autoconnect=False)
     except Exception as e:
         log.error("Control Mode Failed: Unable to connect to cloud - Run Setup")
         control_secret = ""
@@ -341,6 +355,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global proxystats
+        if pw.is_connected() is False:
+            # pylint: disable=attribute-defined-outside-init
+            if self.path == "/" or self.path == "":
+
+                self.path = "/not-ready.html"
+                fcontent, ftype = get_static(web_root, self.path)
+                self.send_response(200)
+                self.send_header('Content-type', '{}'.format(ftype))
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.end_headers()
+                try:
+                    self.wfile.write(fcontent)
+                except Exception as exc:
+                    if "Broken pipe" in str(exc):
+                        log.debug(f"Client disconnected before payload sent [doGET]: {exc}")
+                        return
+                    log.error(f"Error occurred while sending PROXY response to client [doGET]: {exc}")
+                return
+
+            try:
+                self.send_response(503)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write('{"error": "Powerwall not connected"}'.encode("utf8"))
+                return
+            except Exception as exc:
+                if "Broken pipe" in str(exc):
+                    log.debug(f"Client disconnected before payload sent [doGET]: {exc}")
+                    return
+        
         self.send_response(200)
         contenttype = 'application/json'
 
@@ -368,7 +412,10 @@ class Handler(BaseHTTPRequestHandler):
             message: str = json.dumps({"percentage": level})
         elif self.path == '/api/system_status/grid_status':
             # Grid Status - JSON
-            message: str = pw.poll('/api/system_status/grid_status', jsonformat=True)
+            try:
+                message: str = pw.poll('/api/system_status/grid_status', jsonformat=True)
+            except:
+                message = None
         elif self.path == '/csv' or self.path == '/csv/v2':
             # CSV Output - Grid,Home,Solar,Battery,Level
             # CSV2 Output - Grid,Home,Solar,Battery,Level,GridStatus,Reserve
@@ -700,12 +747,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.path = "/index.html"
                 fcontent, ftype = get_static(web_root, self.path)
                 # Replace {VARS} with current data
-                status = pw.status()
-                # convert fcontent to string
-                fcontent = fcontent.decode("utf-8")
-                # fix the following variables that if they are None, return ""
-                fcontent = fcontent.replace("{VERSION}", status["version"] or "")
-                fcontent = fcontent.replace("{HASH}", status["git_hash"] or "")
+                try:
+                    status = pw.status()
+                    # convert fcontent to string
+                    fcontent = fcontent.decode("utf-8")
+                    # fix the following variables that if they are None, return ""
+                    fcontent = fcontent.replace("{VERSION}", status["version"] or "")
+                    fcontent = fcontent.replace("{HASH}", status["git_hash"] or "")
+                except Exception as e:
+                    log.error(f"Error getting Powerwall status: {e}")
+                    
                 fcontent = fcontent.replace("{EMAIL}", email)
                 fcontent = fcontent.replace("{STYLE}", style)
                 # convert fcontent back to bytes
@@ -770,7 +821,7 @@ class Handler(BaseHTTPRequestHandler):
                 if "Broken pipe" in str(exc):
                     log.debug(f"Client disconnected before payload sent [doGET]: {exc}")
                     return
-                log.error(f"Error occured while sending PROXY response to client [doGET]: {exc}")
+                log.error(f"Error occurred while sending PROXY response to client [doGET]: {exc}")
             return
 
         # Count
@@ -799,6 +850,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # noinspection PyTypeChecker
+log.debug("Starting web server")
 with ThreadingHTTPServer((bind_address, port), Handler) as server:
     if https_mode == "yes":
         # Activate HTTPS
@@ -814,6 +866,10 @@ with ThreadingHTTPServer((bind_address, port), Handler) as server:
         server.serve_forever()
     except (Exception, KeyboardInterrupt, SystemExit):
         print(' CANCEL \n')
+        stop_threads = True
+        if connect_thread.is_alive():
+            log.debug("Waiting for connection thread to stop...")
+            connect_thread.join()
 
     log.info("pyPowerwall Proxy Stopped")
     sys.exit(0)
