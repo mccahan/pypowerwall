@@ -274,7 +274,6 @@ if control_secret:
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
-
 # pylint: disable=arguments-differ,global-variable-not-assigned
 # noinspection PyPep8Naming
 class Handler(BaseHTTPRequestHandler):
@@ -291,6 +290,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global proxystats
+
+        if pw.is_connected() is False:
+            try:
+                self.send_response(503)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write('{"error": "Powerwall not connected"}'.encode("utf8"))
+                return
+            except Exception as exc:
+                if "Broken pipe" in str(exc):
+                    log.debug(f"Client disconnected before payload sent [doPOST]: {exc}")
+                    return
+        
         contenttype = 'application/json'
         message = '{"error": "Invalid Request"}'
         if self.path.startswith('/control'):
