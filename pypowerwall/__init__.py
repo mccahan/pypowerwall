@@ -327,14 +327,19 @@ class Powerwall(object):
             recursive   = If True, this is a recursive call and do not allow additional recursive calls
             force       = If True, bypass the cache and make the API call to the gateway, has no meaning in Cloud mode
         """
-        payload = self.client.poll(api, force, recursive, raw)
-        if jsonformat:
-            try:
+        try:
+            payload = self.client.poll(api, force, recursive, raw)
+            if jsonformat:
                 return json.dumps(payload)
-            except JSONDecodeError:
-                log.error(f"Unable to dump response '{payload}' as JSON. I know you asked for it, sorry.")
-        else:
-            return payload
+            else:
+                return payload
+        except JSONDecodeError:
+            log.error(f"Unable to dump response '{payload}' as JSON. I know you asked for it, sorry.")
+            return None
+        except Exception as exc:
+            log.error(f"Failed to poll Powerwall: {exc}")
+            return None
+
 
     def post(self, api: str, payload: Optional[dict], din: Optional[str] = None, jsonformat=False, raw=False,
              recursive=False) -> Optional[Union[dict, list, str, bytes]]:
@@ -728,27 +733,32 @@ class Powerwall(object):
             log.error(f"Invalid value for parameter 'type': {type}")
             raise ValueError("Invalid value for parameter 'type': " + str(type))
 
-        payload: dict = self.poll('/api/system_status/grid_status')
+        try:
+            payload: dict = self.poll('/api/system_status/grid_status')
 
-        if payload is None:
-            log.error("Failed to get /api/system_status/grid_status")
+            if payload is None:
+                log.error("Failed to get /api/system_status/grid_status")
+                return None
+
+            if type == "json":
+                return json.dumps(payload, indent=4, sort_keys=True)
+
+            gridmap = {'SystemGridConnected': {'string': 'UP', 'numeric': 1},
+                    'SystemIslandedActive': {'string': 'DOWN', 'numeric': 0},
+                    'SystemTransitionToGrid': {'string': 'SYNCING', 'numeric': -1},
+                    'SystemTransitionToIsland': {'string': 'SYNCING', 'numeric': -1},
+                    'SystemIslandedReady': {'string': 'SYNCING', 'numeric': -1},
+                    'SystemMicroGridFaulted': {'string': 'DOWN', 'numeric': 0},
+                    'SystemWaitForUser': {'string': 'DOWN', 'numeric': 0}}
+
+            grid_status = payload.get('grid_status')
+            status = gridmap.get(grid_status, {}).get(type)
+            if status is None:
+                log.debug(f"ERROR unable to parse payload '{payload}' for grid_status of type: {type}")
+        except Exception as exc:
+            log.error("Failed to get /api/system_status/grid_status: %s" % exc)
             return None
-
-        if type == "json":
-            return json.dumps(payload, indent=4, sort_keys=True)
-
-        gridmap = {'SystemGridConnected': {'string': 'UP', 'numeric': 1},
-                   'SystemIslandedActive': {'string': 'DOWN', 'numeric': 0},
-                   'SystemTransitionToGrid': {'string': 'SYNCING', 'numeric': -1},
-                   'SystemTransitionToIsland': {'string': 'SYNCING', 'numeric': -1},
-                   'SystemIslandedReady': {'string': 'SYNCING', 'numeric': -1},
-                   'SystemMicroGridFaulted': {'string': 'DOWN', 'numeric': 0},
-                   'SystemWaitForUser': {'string': 'DOWN', 'numeric': 0}}
-
-        grid_status = payload.get('grid_status')
-        status = gridmap.get(grid_status, {}).get(type)
-        if status is None:
-            log.debug(f"ERROR unable to parse payload '{payload}' for grid_status of type: {type}")
+            
         return status
 
     def system_status(self, jsonformat=False) -> Optional[Union[dict, str]]:
