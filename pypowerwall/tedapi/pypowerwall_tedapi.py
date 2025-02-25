@@ -132,16 +132,20 @@ class PyPowerwallTEDAPI(PyPowerwallBase):
         # API Map - Determine what data we need based on Powerwall APIs
         log.debug(f" -- tedapi: Request for {api}")
 
-        func = self.poll_api_map.get(api)
-        if func:
-            kwargs = {
-                'force': force,
-                'recursive': recursive,
-                'raw': raw
-            }
-            return func(**kwargs)
-        else:
-            return {"ERROR": f"Unknown API: {api}"}
+        try:
+            func = self.poll_api_map.get(api)
+            if func:
+                kwargs = {
+                    'force': force,
+                    'recursive': recursive,
+                    'raw': raw
+                }
+                return func(**kwargs)
+            else:
+                return {"ERROR": f"Unknown API: {api}"}
+        except Exception as e:
+            log.error(f"Error in TEDAPI: {e}")
+            return None
 
     def post(self, api: str, payload: Optional[dict], din: Optional[str],
              recursive: bool = False, raw: bool = False) -> Optional[Union[dict, list, str, bytes]]:
@@ -224,6 +228,9 @@ class PyPowerwallTEDAPI(PyPowerwallBase):
         return data
 
     def extract_grid_status(self, status) -> str:
+        if not status:
+            return None
+        
         alerts = lookup(status, ["control", "alerts", "active"]) or []
         if "SystemConnectedToGrid" in alerts:
             return "SystemGridConnected"
