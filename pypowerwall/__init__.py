@@ -248,7 +248,7 @@ class Powerwall(object):
             if not retry and count == 3:
                 raise ConnectionError("Failed to connect to Powerwall with all modes.")
             
-            if self.mode == "local":
+            if self.mode == "local":    
                 log.debug(f"password = {self.password}, gw_pwd = {self.gw_pwd}")
                 try:
                     if not self.password and self.gw_pwd:  # Use full TEDAPI mode
@@ -392,7 +392,11 @@ class Powerwall(object):
         Args:
            jsonformat = If True, return JSON format otherwise return Python Dictionary
         """
-        output = self.client.vitals()
+        try:
+            output = self.client.vitals()
+        except Exception as exc:
+            log.error(f"Failed to get vitals: {exc}")
+            return None
 
         # Return result
         if jsonformat:
