@@ -49,6 +49,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
+import http.server
+import socketserver
+import threading
+import hashlib
+import base64
+import struct
 
 from transform import get_static, inject_js
 import pypowerwall
@@ -274,6 +280,10 @@ if control_secret:
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.websocket_connections = []
+
 # pylint: disable=arguments-differ,global-variable-not-assigned
 # noinspection PyPep8Naming
 class Handler(BaseHTTPRequestHandler):
@@ -365,8 +375,110 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(message.encode("utf8"))
 
+    def handle_websocket(self):
+        # WebSocket handshake
+        key = self.headers.get("Sec-WebSocket-Key")
+        if key:
+            digest = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode('utf-8')).digest())
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", digest.decode('utf-8'))
+            self.end_headers()
+
+            # Register the connection
+            self.server.websocket_connections.append(self)
+
+            # WebSocket communication
+            while True:
+                try:
+                    data = self.receive_websocket_data()
+                    if not data:
+                        break  # Connection closed
+                    print("Received:", data.decode('utf-8'))
+                    self.send_websocket_data(data)  # Echo back
+                except ConnectionResetError:
+                    break
+                except Exception as e:
+                    log.error(f"WebSocket error: {e}")
+                    break
+
+            # Unregister the connection
+            self.server.websocket_connections.remove(self)
+
+    def broadcast_websocket_data(self, data):
+        for connection in self.server.websocket_connections:
+            try:
+                connection.send_websocket_data(data)
+            except Exception as e:
+                log.error(f"Error sending data to WebSocket client: {e}")
+
+    def receive_websocket_data(self):
+        # Receive WebSocket data with handling fragmentation and control frames
+        header = self.rfile.read(2)
+        if len(header) < 2:
+            return None
+
+        fin = header[0] & 0x80
+        opcode = header[0] & 0x0f
+        masked = header[1] & 0x80
+        payload_length = header[1] & 0x7f
+
+        if payload_length == 126:
+            payload_length = struct.unpack(">H", self.rfile.read(2))[0]
+        elif payload_length == 127:
+            payload_length = struct.unpack(">Q", self.rfile.read(8))[0]
+
+        masks = self.rfile.read(4) if masked else None
+        payload = self.rfile.read(payload_length)
+
+         # Unmask the payload
+        if masked:
+            unmasked_payload = bytes([payload[i] ^ masks[i % 4] for i in range(len(payload))])
+        else:
+            unmasked_payload = payload
+        
+        if opcode == 0x08: # Close frame
+            self.send_websocket_close()
+            return None
+        elif opcode == 0x01: # Text frame
+            return unmasked_payload
+        else:
+             return bytes() # Ignore other frames
+
+    def send_websocket_data(self, data):
+        # Send WebSocket data
+        frame = bytearray()
+        frame.append(0x81)  # Text frame, final fragment
+        payload_length = len(data)
+
+        if payload_length < 126:
+            frame.append(payload_length)
+        elif payload_length < 65536:
+            frame.append(126)
+            frame.extend(struct.pack(">H", payload_length))
+        else:
+            frame.append(127)
+            frame.extend(struct.pack(">Q", payload_length))
+
+        frame.extend(data)
+        self.wfile.write(bytes(frame))
+
+    def send_websocket_close(self):
+         # Send WebSocket close frame
+        self.wfile.write(bytes([0x88, 0x00]))
+
     def do_GET(self):
         global proxystats
+
+        log.info("GET %s" % self.path)
+        if connect_thread.is_alive():
+            log.info("Thread running...")
+        log.debug("Connect error: %s" % connect_error)
+
+        if self.headers.get("Upgrade") == "websocket":
+            self.handle_websocket()
+        
         if pw.is_connected() is False:
             # pylint: disable=attribute-defined-outside-init
             if self.path == "/" or self.path == "":
@@ -415,6 +527,12 @@ class Handler(BaseHTTPRequestHandler):
             except:
                 log.error(f"JSON encoding error in payload: {aggregates}")
                 message = None
+            
+            self.broadcast_websocket_data(b'solar_instant_power:' + str(aggregates['solar']['instant_power']).encode('utf-8'))
+            self.broadcast_websocket_data(b'battery_instant_power:' + str(aggregates['battery']['instant_power']).encode('utf-8'))
+            self.broadcast_websocket_data(b'site_instant_power:' + str(aggregates['site']['instant_power']).encode('utf-8'))
+            self.broadcast_websocket_data(b'load_instant_power:' + str(aggregates['load']['instant_power']).encode('utf-8'))
+            
         elif self.path == '/soe':
             # Battery Level - JSON
             message: str = pw.poll('/api/system_status/soe', jsonformat=True)
