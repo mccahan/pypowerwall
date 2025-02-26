@@ -539,6 +539,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/system_status/soe':
             # Force 95% Scale
             level = pw.level(scale=True)
+            self.broadcast_websocket_data(b'battery_level:' + str(level).encode('utf-8'))
             message: str = json.dumps({"percentage": level})
         elif self.path == '/api/system_status/grid_status':
             # Grid Status - JSON
