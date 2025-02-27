@@ -208,7 +208,7 @@ class TEDAPI:
             log.error("Invalid response: No DIN found")
             return None
         
-        print("DIN is " + r.text)
+        log.info("DIN is " + r.text)
         return r.text
 
     def get_config(self,force=False):
