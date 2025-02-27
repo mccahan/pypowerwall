@@ -69,7 +69,7 @@ def run_tedapi_test(auto=False, debug=False):
         print(" FAILED")
         print()
         print(f"ERROR: Unable to connect to Powerwall Gateway {GW_IP} on port 443.")
-        print("Please verify your your host has a route to the Gateway.")
+        print("Please verify your host has a route to the Gateway.")
         print(f"\nError details: {e}")
         sys.exit(1)
 

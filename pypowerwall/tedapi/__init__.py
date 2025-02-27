@@ -51,6 +51,8 @@ import sys
 import time
 import json
 import requests
+import threading
+import queue
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from pypowerwall import __version__
 from . import tedapi_pb2
@@ -96,6 +98,14 @@ class TEDAPI:
         self.din = None
         self.pw3 = False # Powerwall 3 Gateway only supports TEDAPI
         self.apilock = {} # holds the api lock status
+
+        # Request queueing
+        self.request_queue = queue.Queue()
+        self.processing_lock = threading.Lock()
+        self.cache_lock = threading.Lock()
+        self.cache = {}  # {url_key: (timestamp, response_data)}
+        self.MAX_WAIT_TIME = 10  # Maximum time to wait for the queue
+
         if not gw_pwd:
             raise ValueError("Missing gw_pwd")
         if self.debug:
@@ -104,6 +114,64 @@ class TEDAPI:
         # Connect to Powerwall Gateway
         if not self.connect():
             log.error("Failed to connect to Powerwall Gateway")
+        
+        threading.Thread(target=self.process_requests, daemon=True).start()
+
+    def process_requests(self):
+        """Background thread to process queued requests sequentially."""
+        while True:
+            try:
+                cache_key, method, url, payload, response_queue = self.request_queue.get(timeout=self.timeout)
+                log.debug("Processing request for %s", cache_key)
+            except queue.Empty:
+                continue  # No request in queue, keep checking
+
+            # Ensure only one request is processed at a time
+            with self.processing_lock:
+                try:
+                    if method == "get":
+                        log.debug("GET to %s", url)
+                        response = requests.get(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False, timeout=self.timeout)
+                    elif method == "post":
+                        log.debug("POST to %s", url)
+                        response = requests.post(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False,
+                            headers={'Content-type': 'application/octet-string'},
+                            data=payload, timeout=self.timeout)
+
+                    with self.cache_lock:
+                        self.cache[cache_key] = (time.time(), response)
+
+                    response_queue.put((response, response.status_code, ""))
+                except requests.Timeout:
+                    response_queue.put(({"error": "Backend timeout"}, 504, "Timeout"))
+                except requests.RequestException as e:
+                    response_queue.put(({"error": f"Backend error: {str(e)}"}, 502, e))
+                finally:
+                    self.request_queue.task_done()
+
+    def fetch_from_gw(self, method, cache_key, url: str, payload: str):
+        """
+        Fetch data from the backend, using cache when available.
+        Handles request queueing, caching, and backend communication.
+        """
+        # Check cache (thread-safe)
+        with self.cache_lock:
+            if cache_key in self.cache and (time.time() - self.cache[cache_key][0] < self.pwcacheexpire):
+                log.debug("Using cached response for %s", cache_key)
+                return self.cache[cache_key][1], 200, None  # Cached response
+
+        # Add request to queue
+        response_queue = queue.Queue()
+        self.request_queue.put((cache_key, method, url, payload, response_queue))
+
+        try:
+            # Wait for response, but timeout if it takes too long
+            log.debug("Waiting for response for %s", cache_key)
+            r = response_queue.get(timeout=self.MAX_WAIT_TIME)
+            log.debug("Got a response for %s", cache_key)
+            return r
+        except queue.Empty:
+            return {"error": "Request timed out in queue"}, 408, "Request Timeout"  # HTTP 408 Request Timeout
 
     # TEDAPI Functions
 
@@ -124,34 +192,19 @@ class TEDAPI:
         Get the DIN from the Powerwall Gateway
         """
         # Check Cache
-        if not force and "din" in self.pwcachetime:
-            if time.time() - self.pwcachetime["din"] < self.pwcacheexpire:
-                log.debug("Using Cached DIN")
-                return self.pwcache["din"]
-        if not force and self.pwcooldown > time.perf_counter():
-            # Rate limited - return None
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        # Fetch DIN from Powerwall
         log.debug("Fetching DIN from Powerwall...")
         url = f'https://{self.gw_ip}/tedapi/din'
-        r = requests.get(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False, timeout=self.timeout)
-        if r.status_code in BUSY_CODES:
-            # Rate limited - Switch to cooldown mode for 5 minutes
-            self.pwcooldown = time.perf_counter() + 300
-            log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
+        r, status_code, err = self.fetch_from_gw('get', 'din', url, None)
+        if status_code != 200:
+            log.error(f"Error fetching DIN: {err}")
             return None
-        if r.status_code == 403:
-            log.error("Access Denied: Check your Gateway Password")
+        
+        if not r.text:
+            log.error("Invalid response: No DIN found")
             return None
-        if r.status_code != 200:
-            log.error(f"Error fetching DIN: {r.status_code}")
-            return None
-        din = r.text
-        log.debug(f"Connected: Powerwall Gateway DIN: {din}")
-        self.pwcachetime["din"] = time.time()
-        self.pwcache["din"] = din
-        return din
+        
+        print("DIN is " + r.text)
+        return r.text
 
     def get_config(self,force=False):
         """
@@ -184,28 +237,13 @@ class TEDAPI:
             "vin": "1232100-00-E--TG11234567890"
         }
         """
-        # Check for lock and wait if api request already sent
-        if 'config' in self.apilock:
-            locktime = time.perf_counter()
-            while self.apilock['config']:
-                time.sleep(0.2)
-                if time.perf_counter() >= locktime + self.timeout:
-                    log.debug(" -- tedapi: Timeout waiting for config (unable to acquire lock)")
-                    return None
-        # Check Cache
-        if not force and "config" in self.pwcachetime:
-            if time.time() - self.pwcachetime["config"] < self.pwconfigexpire:
-                log.debug("Using Cached Payload")
-                return self.pwcache["config"]
-        if not force and self.pwcooldown > time.perf_counter():
-            # Rate limited - return None
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
+        
         # Check Connection
         if not self.din:
             if not self.connect():
                 log.error("Not Connected - Unable to get configuration")
                 return None
+
         # Fetch Configuration from Powerwall
         log.debug("Get Configuration from Powerwall")
         # Build Protobuf to fetch config
@@ -218,40 +256,25 @@ class TEDAPI:
         pb.tail.value = 1
         url = f'https://{self.gw_ip}/tedapi/v1'
         try:
-            # Set lock
-            self.apilock['config'] = True
-            r = requests.post(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False,
-                                          headers={'Content-type': 'application/octet-string'},
-                                          data=pb.SerializeToString(), timeout=self.timeout)
-            log.debug(f"Response Code: {r.status_code}")
-            if r.status_code in BUSY_CODES:
-                # Rate limited - Switch to cooldown mode for 5 minutes
-                self.pwcooldown = time.perf_counter() + 300
-                log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
-                self.apilock['config'] = False
+            r, result_code, err = self.fetch_from_gw('post', 'config', url, pb.SerializeToString())
+
+            if result_code != 200:
+                log.error(f"Error fetching config: {err}")
                 return None
-            if r.status_code != 200:
-                log.error(f"Error fetching config: {r.status_code}")
-                self.apilock['config'] = False
-                return None
+            
             # Decode response
             tedapi = tedapi_pb2.Message()
             tedapi.ParseFromString(r.content)
             payload = tedapi.message.config.recv.file.text
             try:
                 data = json.loads(payload)
+                return data
             except json.JSONDecodeError as e:
                 log.error(f"Error Decoding JSON: {e}")
                 data = {}
-            log.debug(f"Configuration: {data}")
-            self.pwcachetime["config"] = time.time()
-            self.pwcache["config"] = data
         except Exception as e:
             log.error(f"Error fetching config: {e}")
             data = None
-        finally:
-            # Release lock
-            self.apilock['config'] = False
         return data
 
     def get_status(self, force=False):
@@ -295,24 +318,7 @@ class TEDAPI:
         }
 
         """
-        # Check for lock and wait if api request already sent
-        if 'status' in self.apilock:
-            locktime = time.perf_counter()
-            while self.apilock['status']:
-                time.sleep(0.2)
-                if time.perf_counter() >= locktime + self.timeout:
-                    log.debug(" -- tedapi: Timeout waiting for status (unable to acquire lock)")
-                    return None
-        # Check Cache
-        if not force and "status" in self.pwcachetime:
-            if time.time() - self.pwcachetime["status"] < self.pwcacheexpire:
-                log.debug("Using Cached Payload")
-                return self.pwcache["status"]
-        if not force and self.pwcooldown > time.perf_counter():
-            # Rate limited - return None
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        # Check Connection
+
         if not self.din:
             if not self.connect():
                 log.error("Not Connected - Unable to get status")
@@ -331,41 +337,29 @@ class TEDAPI:
         pb.message.payload.send.b.value = "{}"
         pb.tail.value = 1
         url = f'https://{self.gw_ip}/tedapi/v1'
+        
         try:
-            # Set lock
-            self.apilock['status'] = True
-            r = requests.post(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False,
-                                          headers={'Content-type': 'application/octet-string'},
-                                          data=pb.SerializeToString(), timeout=self.timeout)
-            log.debug(f"Response Code: {r.status_code}")
-            if r.status_code in BUSY_CODES:
-                # Rate limited - Switch to cooldown mode for 5 minutes
-                self.pwcooldown = time.perf_counter() + 300
-                log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
-                self.apilock['status'] = False
+            r, result_code, err = self.fetch_from_gw('post', 'status', url, pb.SerializeToString())
+
+            if result_code != 200:
+                log.error(f"Error fetching status: {err}")
                 return None
-            if r.status_code != 200:
-                log.error(f"Error fetching status: {r.status_code}")
-                self.apilock['status'] = False
-                return None
+            
             # Decode response
             tedapi = tedapi_pb2.Message()
             tedapi.ParseFromString(r.content)
             payload = tedapi.message.payload.recv.text
             try:
                 data = json.loads(payload)
+                return data
             except json.JSONDecodeError as e:
                 log.error(f"Error Decoding JSON: {e}")
                 data = {}
+
             log.debug(f"Status: {data}")
-            self.pwcachetime["status"] = time.time()
-            self.pwcache["status"] = data
         except Exception as e:
             log.error(f"Error fetching status: {e}")
             data = None
-        finally:
-            # Release lock
-            self.apilock['status'] = False
         return data
 
     def get_device_controller(self, force=False):
@@ -386,30 +380,10 @@ class TEDAPI:
 
         TODO: Refactor to combine tedapi queries
         """
-        # Check for lock and wait if api request already sent
-        if 'controller' in self.apilock:
-            locktime = time.perf_counter()
-            while self.apilock['controller']:
-                time.sleep(0.2)
-                if time.perf_counter() >= locktime + self.timeout:
-                    log.debug(" -- tedapi: Timeout waiting for controller data (unable to acquire lock)")
-                    return None
-        # Check Cache
-        if not force and "controller" in self.pwcachetime:
-            if time.time() - self.pwcachetime["controller"] < self.pwcacheexpire:
-                log.debug("Using Cached Payload")
-                return self.pwcache["controller"]
-        if not force and self.pwcooldown > time.perf_counter():
-            # Rate limited - return None
-            log.debug('Rate limit cooldown period - Pausing API calls')
-            return None
-        # Check Connection
-        if not self.din:
-            if not self.connect():
-                log.error("Not Connected - Unable to get controller data")
-                return None
+        
         # Fetch Current Status from Powerwall
         log.debug("Get controller data from Powerwall")
+        
         # Build Protobuf to fetch controller data
         pb = tedapi_pb2.Message()
         pb.message.deliveryChannel = 1
@@ -423,41 +397,25 @@ class TEDAPI:
         pb.tail.value = 1
         url = f'https://{self.gw_ip}/tedapi/v1'
         try:
-            # Set lock
-            self.apilock['controller'] = True
-            r = requests.post(url, auth=('Tesla_Energy_Device', self.gw_pwd), verify=False,
-                                          headers={'Content-type': 'application/octet-string'},
-                                          data=pb.SerializeToString(), timeout=self.timeout)
-            log.debug(f"Response Code: {r.status_code}")
-            if r.status_code in BUSY_CODES:
-                # Rate limited - Switch to cooldown mode for 5 minutes
-                self.pwcooldown = time.perf_counter() + 300
-                log.error('Possible Rate limited by Powerwall at - Activating 5 minute cooldown')
-                self.apilock['controller'] = False
+            r, result_code, err = self.fetch_from_gw('post', 'controller', url, pb.SerializeToString())
+
+            if result_code != 200:
+                log.error(f"Error fetching controller: {err}")
                 return None
-            if r.status_code != 200:
-                log.error(f"Error fetching controller data: {r.status_code}")
-                self.apilock['controller'] = False
-                return None
+            
             # Decode response
             tedapi = tedapi_pb2.Message()
             tedapi.ParseFromString(r.content)
             payload = tedapi.message.payload.recv.text
-            log.debug(f"Payload: {payload}")
             try:
                 data = json.loads(payload)
+                return data
             except json.JSONDecodeError as e:
                 log.error(f"Error Decoding JSON: {e}")
                 data = {}
-            log.debug(f"Status: {data}")
-            self.pwcachetime["controller"] = time.time()
-            self.pwcache["controller"] = data
         except Exception as e:
-            log.error(f"Error fetching controller data: {e}")
+            log.error(f"Error fetching config: {e}")
             data = None
-        finally:
-            # Release lock
-            self.apilock['controller'] = False
         return data
 
     def get_firmware_version(self, force=False, details=False):
@@ -905,7 +863,7 @@ class TEDAPI:
             self.din = self.get_din()
         except Exception as e:
             log.error(f"Unable to connect to Powerwall Gateway {self.gw_ip}")
-            log.error("Please verify your your host has a route to the Gateway.")
+            log.error("Please verify your host has a route to the Gateway.")
             log.error(f"Error Details: {e}")
         return self.din
 
