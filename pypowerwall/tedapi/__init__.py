@@ -56,7 +56,7 @@ import queue
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from pypowerwall import __version__
 from . import tedapi_pb2
-from .messages import TEDAPIMessage, StatusMessage, ControllerMessage
+from .messages import TEDAPIMessage, StatusMessage, ControllerMessage, FirmwareVersionMessage
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # TEDAPI Fixed Gateway IP Address
@@ -427,13 +427,61 @@ class TEDAPI:
         # Fetch Current Status from Powerwall
         log.debug("Get Firmware Version from Powerwall")
         # Build Protobuf to fetch status
-        pb = tedapi_pb2.Message()
-        pb.message.deliveryChannel = 1
-        pb.message.sender.local = 1
-        pb.message.recipient.din = self.din  # DIN of Powerwall
-        pb.message.firmware.request = ""
-        pb.tail.value = 1
+        message = FirmwareVersionMessage(self.din)
         url = f'https://{self.gw_ip}/tedapi/v1'
+
+        try:
+            r, result_code, err = self.fetch_from_gw('post', 'firmware_version', url, message)
+
+            if result_code != 200:
+                log.error(f"Error fetching firmware version: {err}")
+                return None
+            
+            # Decode response
+            firmware = message.decode_response(r.content)
+            firmware_version = firmware.system.version.text
+
+            log.debug(f"Firmware Version: {firmware_version}")
+            log.debug("Firmware information: %s", firmware)
+
+            if details:
+                payload = {
+                    "system": {
+                        "gateway": {
+                            "partNumber": firmware.system.gateway.partNumber,
+                            "serialNumber": firmware.system.gateway.serialNumber
+                        },
+                        "din": firmware.system.din,
+                        "version": {
+                            "text": firmware.system.version.text,
+                            "githash": firmware.system.version.githash
+                        },
+                        "five": firmware.system.five,
+                        "six": firmware.system.six,
+                        "wireless": {
+                            "device": []
+                        }
+                    }
+                }
+                try:
+                    for device in firmware.system.wireless.device:
+                        payload["system"]["wireless"]["device"].append({
+                            "company": device.company.value,
+                            "model": device.model.value,
+                            "fcc_id": device.fcc_id.value,
+                            "ic": device.ic.value
+                        })
+                except Exception as e:
+                    log.debug(f"Error parsing wireless devices: {e}")
+                log.debug(f"Firmware Version: {payload}")
+            else:
+                payload = firmware_version
+        except json.JSONDecodeError as e:
+            log.error(f"Error Decoding JSON: {e}")
+            payload = None
+
+        return payload
+            
         try:
             # Set lock
             self.apilock['firmware'] = True

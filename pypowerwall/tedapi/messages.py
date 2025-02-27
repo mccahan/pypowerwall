@@ -55,3 +55,21 @@ class ControllerMessage(TEDAPIMessage):
         pb.message.payload.send.b.value = '{"msaComp":{"types" :["PVS","PVAC", "TESYNC", "TEPINV", "TETHC", "STSTSM",  "TEMSA", "TEPINV" ]},\n\t"msaSignals":[\n\t"MSA_pcbaId",\n\t"MSA_usageId",\n\t"MSA_appGitHash",\n\t"MSA_HeatingRateOccurred",\n\t"THC_AmbientTemp",\n\t"METER_Z_CTA_InstRealPower",\n\t"METER_Z_CTA_InstReactivePower",\n\t"METER_Z_CTA_I",\n\t"METER_Z_VL1G",\n\t"METER_Z_CTB_InstRealPower",\n\t"METER_Z_CTB_InstReactivePower",\n\t"METER_Z_CTB_I",\n\t"METER_Z_VL2G"]}'
         pb.tail.value = 1
         return pb
+    
+class FirmwareVersionMessage(TEDAPIMessage):
+    def __init__(self, din):
+        self.din = din
+
+    def decode_response(self, response):
+        tedapi = tedapi_pb2.Message()
+        tedapi.ParseFromString(response)
+        return tedapi.message.firmware
+    
+    def get_message(self):
+        pb = tedapi_pb2.Message()
+        pb.message.deliveryChannel = 1
+        pb.message.sender.local = 1
+        pb.message.recipient.din = self.din  # DIN of Powerwall
+        pb.message.firmware.request = ""
+        pb.tail.value = 1
+        return pb
