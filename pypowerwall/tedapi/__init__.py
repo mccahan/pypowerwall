@@ -382,7 +382,7 @@ class TEDAPI:
         url = f'https://{self.gw_ip}/tedapi/v1'
 
         try:
-            r, result_code, err = self.fetch_from_gw('post', 'controller', url, message)
+            r, result_code, err = self.fetch_from_gw('post', 'controller', url, message, force)
 
             if result_code != 200:
                 log.error(f"Error fetching controller: {err}")
@@ -431,7 +431,7 @@ class TEDAPI:
         url = f'https://{self.gw_ip}/tedapi/v1'
 
         try:
-            r, result_code, err = self.fetch_from_gw('post', 'firmware_version', url, message)
+            r, result_code, err = self.fetch_from_gw('post', 'firmware_version', url, message, force)
 
             if result_code != 200:
                 log.error(f"Error fetching firmware version: {err}")
@@ -510,7 +510,7 @@ class TEDAPI:
         url = f'https://{self.gw_ip}/tedapi/v1'
 
         try:
-            r, result_code, err = self.fetch_from_gw('post', 'components', url, message)
+            r, result_code, err = self.fetch_from_gw('post', 'components', url, message, force)
 
             if result_code != 200:
                 log.error(f"Error fetching components: {err}")
