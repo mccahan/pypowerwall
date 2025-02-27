@@ -342,7 +342,7 @@ class TEDAPI:
                 return None
             
             # Decode response
-            data = pb.decode_response(r.content)
+            data = message.decode_response(r.content)
             log.debug(f"Status: {data}")
 
         except json.JSONDecodeError as e:
@@ -389,13 +389,10 @@ class TEDAPI:
                 return None
             
             # Decode response
-            tedapi = tedapi_pb2.Message()
-            tedapi.ParseFromString(r.content)
-            payload = tedapi.message.payload.recv.text
-            try:
-                data = json.loads(payload)
-                return data
-            except json.JSONDecodeError as e:
+            data = message.decode_response(r.content)
+            return data
+        
+        except json.JSONDecodeError as e:
                 log.error(f"Error Decoding JSON: {e}")
                 data = {}
         except Exception as e:

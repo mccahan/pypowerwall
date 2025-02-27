@@ -12,9 +12,9 @@ class StatusMessage(TEDAPIMessage):
     def __init__(self, din):
         self.din = din
       
-    def decode_response(response):
+    def decode_response(self, response):
         tedapi = tedapi_pb2.Message()
-        tedapi.ParseFromString(r.content)
+        tedapi.ParseFromString(response)
         payload = tedapi.message.payload.recv.text
         data = json.loads(payload)
         return data
@@ -36,9 +36,9 @@ class ControllerMessage(TEDAPIMessage):
     def __init__(self, din):
         self.din = din
     
-    def decode_response(response):
+    def decode_response(self, response):
         tedapi = tedapi_pb2.Message()
-        tedapi.ParseFromString(r.content)
+        tedapi.ParseFromString(response)
         payload = tedapi.message.payload.recv.text
         data = json.loads(payload)
         return data
