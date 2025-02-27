@@ -149,16 +149,17 @@ class TEDAPI:
                 finally:
                     self.request_queue.task_done()
 
-    def fetch_from_gw(self, method, cache_key, url: str, payload: str):
+    def fetch_from_gw(self, method, cache_key, url: str, payload: str, force=False):
         """
         Fetch data from the backend, using cache when available.
         Handles request queueing, caching, and backend communication.
         """
         # Check cache (thread-safe)
-        with self.cache_lock:
-            if cache_key in self.cache and (time.time() - self.cache[cache_key][0] < self.pwcacheexpire):
-                log.debug("Using cached response for %s", cache_key)
-                return self.cache[cache_key][1], 200, None  # Cached response
+        if not force:
+            with self.cache_lock:
+                if cache_key in self.cache and (time.time() - self.cache[cache_key][0] < self.pwcacheexpire):
+                    log.debug("Using cached response for %s", cache_key)
+                    return self.cache[cache_key][1], 200, None  # Cached response
 
         # Add request to queue
         response_queue = queue.Queue()
@@ -194,7 +195,7 @@ class TEDAPI:
         # Check Cache
         log.debug("Fetching DIN from Powerwall...")
         url = f'https://{self.gw_ip}/tedapi/din'
-        r, status_code, err = self.fetch_from_gw('get', 'din', url, None)
+        r, status_code, err = self.fetch_from_gw('get', 'din', url, None, force)
         if status_code != 200:
             log.error(f"Error fetching DIN: {err}")
             return None
@@ -256,7 +257,7 @@ class TEDAPI:
         pb.tail.value = 1
         url = f'https://{self.gw_ip}/tedapi/v1'
         try:
-            r, result_code, err = self.fetch_from_gw('post', 'config', url, pb.SerializeToString())
+            r, result_code, err = self.fetch_from_gw('post', 'config', url, pb.SerializeToString(), force)
 
             if result_code != 200:
                 log.error(f"Error fetching config: {err}")
@@ -339,7 +340,7 @@ class TEDAPI:
         url = f'https://{self.gw_ip}/tedapi/v1'
         
         try:
-            r, result_code, err = self.fetch_from_gw('post', 'status', url, pb.SerializeToString())
+            r, result_code, err = self.fetch_from_gw('post', 'status', url, pb.SerializeToString(), force)
 
             if result_code != 200:
                 log.error(f"Error fetching status: {err}")
