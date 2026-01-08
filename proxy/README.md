@@ -73,6 +73,24 @@ This pyPowerwall Caching Proxy handles authentication to the Powerwall Gateway a
         # Required login process for Cloud Mode
         docker exec -it pypowerwall python3 -m pypowerwall setup -email=email@example.com
         docker restart pypowerwall
+
+    # Local Access with MQTT Publishing - Publish power metrics to MQTT broker
+        docker run \
+            -d \
+            -p 8675:8675 \
+            -e PW_PORT='8675' \
+            -e PW_HOST='192.168.91.1' \
+            -e PW_GW_PWD='Gateway_Password' \
+            -e PW_TIMEZONE='America/Chicago' \
+            -e TZ='America/Chicago' \
+            -e PW_MQTT_HOST='mqtt.example.com' \
+            -e PW_MQTT_PORT='1883' \
+            -e PW_MQTT_USER='mqtt_user' \
+            -e PW_MQTT_PASSWORD='mqtt_password' \
+            -e PW_MQTT_TOPIC_PREFIX='pypowerwall' \
+            --name pypowerwall \
+            --restart unless-stopped \
+            jasonacox/pypowerwall
     ```
 
 2. Test the Proxy
@@ -260,6 +278,23 @@ Network Robustness Settings
 * PW_GRACEFUL_DEGRADATION - Return cached data when fresh data unavailable ("yes") - Improves reliability for monitoring tools
 * PW_HEALTH_CHECK - Enable connection health monitoring and degraded mode detection ("yes")
 * PW_CACHE_TTL - Maximum age in seconds for cached data before returning null ("30") - Ensures data freshness over availability
+
+MQTT Settings
+
+* PW_MQTT_HOST - MQTT broker hostname or IP address ("") - If set, MQTT publishing is enabled
+* PW_MQTT_PORT - MQTT broker port ("1883")
+* PW_MQTT_USER - MQTT broker username ("") - Optional, if broker requires authentication
+* PW_MQTT_PASSWORD - MQTT broker password ("") - Optional, if broker requires authentication
+* PW_MQTT_TOPIC_PREFIX - MQTT topic prefix ("pypowerwall") - All topics will be prefixed with this value
+
+When MQTT is enabled, the proxy will publish meter aggregate `instant_power` values to the following topics whenever data is fetched:
+* `{prefix}/site/instant_power` - Grid power (watts)
+* `{prefix}/solar/instant_power` - Solar power (watts)
+* `{prefix}/battery/instant_power` - Battery power (watts, negative = charging)
+* `{prefix}/load/instant_power` - Home load power (watts)
+* `{prefix}/level/instant_power` - Battery level (if available)
+
+The proxy will continue to operate normally even if MQTT connection fails or publishing errors occur.
 
 UI and Advanced Settings
 * PW_STYLE - Background color style for iframe [animation](http://localhost:8675/example.html) ("clear") - options:
