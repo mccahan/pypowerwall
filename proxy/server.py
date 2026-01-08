@@ -1550,6 +1550,18 @@ class Handler(BaseHTTPRequestHandler):
                 if endpoint_stats:
                     health_info["endpoint_statistics"] = endpoint_stats
 
+            # Add MQTT status if enabled
+            if mqtt_enabled:
+                with proxystats_lock:
+                    health_info["mqtt_status"] = {
+                        "enabled": mqtt_enabled,
+                        "connected": proxystats["mqtt_connected"],
+                        "publish_count": proxystats["mqtt_publish_count"],
+                        "error_count": proxystats["mqtt_error_count"],
+                        "broker": f"{mqtt_host}:{mqtt_port}",
+                        "topic_prefix": mqtt_topic_prefix,
+                    }
+
             message: str = json.dumps(health_info)
         elif request_path == "/health/reset":
             # Reset Health Counters and Clear Cache
