@@ -849,8 +849,18 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
     """
     Publish meter aggregate instant_power values to MQTT.
     
+    Extracts and publishes instant_power from the following meter types:
+    - site: Grid power (watts)
+    - solar: Solar generation power (watts)
+    - battery: Battery charge/discharge power (watts, negative = charging)
+    - load: Home consumption power (watts)
+    
     Args:
-        aggregates_data: Dictionary or JSON string containing meter aggregates
+        aggregates_data: Dictionary or JSON string containing meter aggregates.
+                        Expected structure: {'site': {'instant_power': float}, 
+                                           'solar': {'instant_power': float},
+                                           'battery': {'instant_power': float},
+                                           'load': {'instant_power': float}}
     """
     if not mqtt_enabled or mqtt_client is None:
         return
@@ -892,12 +902,6 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
             load_power = aggregates['load'].get('instant_power')
             if load_power is not None:
                 publish_mqtt("load/instant_power", load_power)
-        
-        # level (battery level/SOE)
-        if 'level' in aggregates and isinstance(aggregates['level'], dict):
-            level = aggregates['level'].get('instant_power')
-            if level is not None:
-                publish_mqtt("level/instant_power", level)
     
     except Exception as e:
         # Silently handle errors - MQTT should not break the proxy

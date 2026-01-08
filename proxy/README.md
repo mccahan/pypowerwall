@@ -293,7 +293,6 @@ When MQTT is enabled, the proxy will publish meter aggregate `instant_power` val
 * `{prefix}/solar/instant_power` - Solar power (watts)
 * `{prefix}/battery/instant_power` - Battery power (watts, negative = charging)
 * `{prefix}/load/instant_power` - Home load power (watts)
-* `{prefix}/level/instant_power` - Battery level (if available)
 
 The proxy will continue to operate normally even if MQTT connection fails or publishing errors occur.
 
