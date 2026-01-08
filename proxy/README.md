@@ -286,6 +286,7 @@ MQTT Settings
 * PW_MQTT_USER - MQTT broker username ("") - Optional, if broker requires authentication
 * PW_MQTT_PASSWORD - MQTT broker password ("") - Optional, if broker requires authentication
 * PW_MQTT_TOPIC_PREFIX - MQTT topic prefix ("pypowerwall") - All topics will be prefixed with this value
+* PW_MQTT_CLIENT_ID - MQTT client ID ("pypowerwall-proxy") - Override for multi-instance deployments
 
 When MQTT is enabled, the proxy will publish meter aggregate `instant_power` values to the following topics whenever data is fetched:
 * `{prefix}/site/instant_power` - Grid power (watts)

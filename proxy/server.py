@@ -226,6 +226,7 @@ mqtt_port = int(os.getenv("PW_MQTT_PORT", "1883"))
 mqtt_user = os.getenv("PW_MQTT_USER", "")
 mqtt_password = os.getenv("PW_MQTT_PASSWORD", "")
 mqtt_topic_prefix = os.getenv("PW_MQTT_TOPIC_PREFIX", "pypowerwall")
+mqtt_client_id = os.getenv("PW_MQTT_CLIENT_ID", "pypowerwall-proxy")
 
 # Global Stats
 proxystats = {
@@ -286,6 +287,7 @@ proxystats = {
         "PW_MQTT_USER": mqtt_user if mqtt_user else None,
         "PW_MQTT_PASSWORD": "*" * len(mqtt_password) if mqtt_password else None,
         "PW_MQTT_TOPIC_PREFIX": mqtt_topic_prefix if mqtt_enabled else None,
+        "PW_MQTT_CLIENT_ID": mqtt_client_id if mqtt_enabled else None,
     },
 }
 proxystats_lock = threading.RLock()
@@ -356,8 +358,9 @@ def init_mqtt_client():
         return None
     
     try:
-        # Create MQTT client
-        client = mqtt.Client(client_id=f"pypowerwall-proxy-{os.getpid()}")
+        # Create MQTT client with stable identifier
+        # Allow override via environment variable for multi-instance deployments
+        client = mqtt.Client(client_id=mqtt_client_id)
         
         # Set username and password if provided
         if mqtt_user and mqtt_password:
@@ -407,7 +410,7 @@ def publish_mqtt(topic, value):
     """
     global mqtt_client, proxystats
     
-    if not mqtt_enabled or mqtt_client is None:
+    if not mqtt_enabled or mqtt_client is None or not MQTT_AVAILABLE:
         return
     
     try:
@@ -865,13 +868,7 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
         if not isinstance(aggregates, dict):
             return
         
-        # Publish instant_power for each meter type
-        # level (battery level/SOE)
-        if 'level' in aggregates and isinstance(aggregates['level'], dict):
-            level = aggregates['level'].get('instant_power')
-            if level is not None:
-                publish_mqtt("level/instant_power", level)
-        
+        # Publish instant_power for each meter type in logical order
         # site (grid)
         if 'site' in aggregates and isinstance(aggregates['site'], dict):
             site_power = aggregates['site'].get('instant_power')
@@ -895,6 +892,12 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
             load_power = aggregates['load'].get('instant_power')
             if load_power is not None:
                 publish_mqtt("load/instant_power", load_power)
+        
+        # level (battery level/SOE)
+        if 'level' in aggregates and isinstance(aggregates['level'], dict):
+            level = aggregates['level'].get('instant_power')
+            if level is not None:
+                publish_mqtt("level/instant_power", level)
     
     except Exception as e:
         # Silently handle errors - MQTT should not break the proxy

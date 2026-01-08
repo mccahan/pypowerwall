@@ -52,6 +52,7 @@ class TestMQTTPublishing(unittest.TestCase):
         self.mock_client.publish.return_value = mock_result
 
     @patch.object(server, 'mqtt_enabled', True)
+    @patch.object(server, 'MQTT_AVAILABLE', True)
     @patch.object(server, 'mqtt_client')
     @patch.object(server, 'mqtt_topic_prefix', 'test')
     @patch.object(server, 'debugmode', False)
