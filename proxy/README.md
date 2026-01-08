@@ -83,11 +83,11 @@ This pyPowerwall Caching Proxy handles authentication to the Powerwall Gateway a
             -e PW_GW_PWD='Gateway_Password' \
             -e PW_TIMEZONE='America/Chicago' \
             -e TZ='America/Chicago' \
-            -e PW_MQTT_HOST='mqtt.example.com' \
-            -e PW_MQTT_PORT='1883' \
-            -e PW_MQTT_USER='mqtt_user' \
-            -e PW_MQTT_PASSWORD='mqtt_password' \
-            -e PW_MQTT_TOPIC_PREFIX='pypowerwall' \
+            -e MQTT_HOST='mqtt.example.com' \
+            -e MQTT_PORT='1883' \
+            -e MQTT_USER='mqtt_user' \
+            -e MQTT_PASSWORD='mqtt_password' \
+            -e MQTT_TOPIC_PREFIX='pypowerwall' \
             --name pypowerwall \
             --restart unless-stopped \
             jasonacox/pypowerwall
@@ -281,17 +281,18 @@ Network Robustness Settings
 
 MQTT Settings
 
-* PW_MQTT_HOST - MQTT broker hostname or IP address ("") - If set, MQTT publishing is enabled
-* PW_MQTT_PORT - MQTT broker port ("1883")
-* PW_MQTT_USER - MQTT broker username ("") - Optional, if broker requires authentication
-* PW_MQTT_PASSWORD - MQTT broker password ("") - Optional, if broker requires authentication
-* PW_MQTT_TOPIC_PREFIX - MQTT topic prefix ("pypowerwall") - All topics will be prefixed with this value
-* PW_MQTT_CLIENT_ID - MQTT client ID ("pypowerwall-proxy") - Override for multi-instance deployments
+* MQTT_HOST - MQTT broker hostname or IP address ("") - If set, MQTT publishing is enabled
+* MQTT_PORT - MQTT broker port ("1883")
+* MQTT_USER - MQTT broker username ("") - Optional, if broker requires authentication
+* MQTT_PASSWORD - MQTT broker password ("") - Optional, if broker requires authentication
+* MQTT_TOPIC_PREFIX - MQTT topic prefix ("pypowerwall") - All topics will be prefixed with this value
+* MQTT_CLIENT_ID - MQTT client ID ("pypowerwall-proxy") - Override for multi-instance deployments
 
-When MQTT is enabled, the proxy will publish meter aggregate `instant_power` values to the following topics whenever data is fetched:
+When MQTT is enabled, the proxy will publish meter aggregate `instant_power` values and battery level to the following topics whenever data is fetched:
 * `{prefix}/site/instant_power` - Grid power (watts)
 * `{prefix}/solar/instant_power` - Solar power (watts)
 * `{prefix}/battery/instant_power` - Battery power (watts, negative = charging)
+* `{prefix}/battery/level` - Battery level (percentage)
 * `{prefix}/load/instant_power` - Home load power (watts)
 
 The proxy will continue to operate normally even if MQTT connection fails or publishing errors occur.

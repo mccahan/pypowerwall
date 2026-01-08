@@ -16,11 +16,11 @@ class TestMQTTConfiguration(unittest.TestCase):
     """Test MQTT configuration and initialization"""
 
     @patch.dict('os.environ', {
-        'PW_MQTT_HOST': 'mqtt.example.com',
-        'PW_MQTT_PORT': '1883',
-        'PW_MQTT_USER': 'testuser',
-        'PW_MQTT_PASSWORD': 'testpass',
-        'PW_MQTT_TOPIC_PREFIX': 'powerwall'
+        'MQTT_HOST': 'mqtt.example.com',
+        'MQTT_PORT': '1883',
+        'MQTT_USER': 'testuser',
+        'MQTT_PASSWORD': 'testpass',
+        'MQTT_TOPIC_PREFIX': 'powerwall'
     })
     def test_mqtt_config_from_env(self):
         """Test MQTT configuration is read from environment variables"""
@@ -104,42 +104,56 @@ class TestMQTTAggregatesPublishing(unittest.TestCase):
 
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'mqtt_client', MagicMock())
+    @patch.object(server, 'safe_pw_call')
     @patch.object(server, 'publish_mqtt')
-    def test_publish_aggregates_from_dict(self, mock_publish):
+    def test_publish_aggregates_from_dict(self, mock_publish, mock_safe_pw_call):
         """Test publishing aggregates from dictionary"""
+        # Mock battery level
+        mock_safe_pw_call.return_value = 85.5
+        
         server.publish_meter_aggregates_to_mqtt(self.aggregates_dict)
         
-        # Verify all meter types were published
+        # Verify all meter types and battery level were published (4 instant_power + 1 level = 5)
         calls = [str(call) for call in mock_publish.call_args_list]
-        self.assertEqual(len(mock_publish.call_args_list), 4)
+        self.assertEqual(len(mock_publish.call_args_list), 5)
         
         # Verify specific calls were made
         mock_publish.assert_any_call("site/instant_power", 1500.5)
         mock_publish.assert_any_call("solar/instant_power", 3000.0)
         mock_publish.assert_any_call("battery/instant_power", -500.25)
         mock_publish.assert_any_call("load/instant_power", 2000.75)
+        mock_publish.assert_any_call("battery/level", 85.5)
 
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'mqtt_client', MagicMock())
+    @patch.object(server, 'safe_pw_call')
     @patch.object(server, 'publish_mqtt')
-    def test_publish_aggregates_from_json_string(self, mock_publish):
+    def test_publish_aggregates_from_json_string(self, mock_publish, mock_safe_pw_call):
         """Test publishing aggregates from JSON string"""
+        # Mock battery level
+        mock_safe_pw_call.return_value = 85.5
+        
         server.publish_meter_aggregates_to_mqtt(self.aggregates_json)
         
-        # Verify all meter types were published
-        self.assertEqual(len(mock_publish.call_args_list), 4)
+        # Verify all meter types and battery level were published (4 instant_power + 1 level = 5)
+        self.assertEqual(len(mock_publish.call_args_list), 5)
         
         # Verify specific calls were made
         mock_publish.assert_any_call("site/instant_power", 1500.5)
         mock_publish.assert_any_call("solar/instant_power", 3000.0)
         mock_publish.assert_any_call("battery/instant_power", -500.25)
         mock_publish.assert_any_call("load/instant_power", 2000.75)
+        mock_publish.assert_any_call("battery/level", 85.5)
 
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'mqtt_client', MagicMock())
+    @patch.object(server, 'safe_pw_call')
     @patch.object(server, 'publish_mqtt')
-    def test_publish_aggregates_partial_data(self, mock_publish):
+    def test_publish_aggregates_partial_data(self, mock_publish, mock_safe_pw_call):
         """Test publishing aggregates with partial data"""
+        # Mock battery level
+        mock_safe_pw_call.return_value = 50.0
+        
         partial_aggregates = {
             "site": {"instant_power": 1500.5},
             "solar": {"instant_power": 3000.0},
@@ -147,10 +161,11 @@ class TestMQTTAggregatesPublishing(unittest.TestCase):
         
         server.publish_meter_aggregates_to_mqtt(partial_aggregates)
         
-        # Verify only available meter types were published
-        self.assertEqual(len(mock_publish.call_args_list), 2)
+        # Verify only available meter types were published (2 instant_power + 1 battery level = 3)
+        self.assertEqual(len(mock_publish.call_args_list), 3)
         mock_publish.assert_any_call("site/instant_power", 1500.5)
         mock_publish.assert_any_call("solar/instant_power", 3000.0)
+        mock_publish.assert_any_call("battery/level", 50.0)
 
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'mqtt_client', MagicMock())
@@ -198,9 +213,13 @@ class TestMQTTAggregatesPublishing(unittest.TestCase):
 
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'mqtt_client', MagicMock())
+    @patch.object(server, 'safe_pw_call')
     @patch.object(server, 'publish_mqtt')
-    def test_publish_aggregates_null_values(self, mock_publish):
+    def test_publish_aggregates_null_values(self, mock_publish, mock_safe_pw_call):
         """Test handling of null instant_power values"""
+        # Mock battery level
+        mock_safe_pw_call.return_value = 60.0
+        
         aggregates_with_nulls = {
             "site": {"instant_power": None},
             "solar": {"instant_power": 3000.0},
@@ -208,9 +227,10 @@ class TestMQTTAggregatesPublishing(unittest.TestCase):
         
         server.publish_meter_aggregates_to_mqtt(aggregates_with_nulls)
         
-        # Verify only non-null values were published
-        self.assertEqual(len(mock_publish.call_args_list), 1)
+        # Verify only non-null values were published (1 instant_power + 1 battery level = 2)
+        self.assertEqual(len(mock_publish.call_args_list), 2)
         mock_publish.assert_any_call("solar/instant_power", 3000.0)
+        mock_publish.assert_any_call("battery/level", 60.0)
 
 
 class TestMQTTIntegrationWithSafeEndpointCall(unittest.TestCase):

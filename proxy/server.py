@@ -220,13 +220,13 @@ degradation_cache_ttl_seconds = int(
 )  # Maximum age for cached data before returning None
 
 # MQTT Configuration
-mqtt_enabled = os.getenv("PW_MQTT_HOST", "") != ""
-mqtt_host = os.getenv("PW_MQTT_HOST", "")
-mqtt_port = int(os.getenv("PW_MQTT_PORT", "1883"))
-mqtt_user = os.getenv("PW_MQTT_USER", "")
-mqtt_password = os.getenv("PW_MQTT_PASSWORD", "")
-mqtt_topic_prefix = os.getenv("PW_MQTT_TOPIC_PREFIX", "pypowerwall")
-mqtt_client_id = os.getenv("PW_MQTT_CLIENT_ID", "pypowerwall-proxy")
+mqtt_enabled = os.getenv("MQTT_HOST", "") != ""
+mqtt_host = os.getenv("MQTT_HOST", "")
+mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
+mqtt_user = os.getenv("MQTT_USER", "")
+mqtt_password = os.getenv("MQTT_PASSWORD", "")
+mqtt_topic_prefix = os.getenv("MQTT_TOPIC_PREFIX", "pypowerwall")
+mqtt_client_id = os.getenv("MQTT_CLIENT_ID", "pypowerwall-proxy")
 
 # Global Stats
 proxystats = {
@@ -847,13 +847,15 @@ def safe_pw_call(pw_func, *args, **kwargs):
 
 def publish_meter_aggregates_to_mqtt(aggregates_data):
     """
-    Publish meter aggregate instant_power values to MQTT.
+    Publish meter aggregate instant_power values and battery level to MQTT.
     
     Extracts and publishes instant_power from the following meter types:
     - site: Grid power (watts)
     - solar: Solar generation power (watts)
     - battery: Battery charge/discharge power (watts, negative = charging)
     - load: Home consumption power (watts)
+    
+    Also publishes battery level (percentage) to battery/level.
     
     Args:
         aggregates_data: Dictionary or JSON string containing meter aggregates.
@@ -902,6 +904,11 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
             load_power = aggregates['load'].get('instant_power')
             if load_power is not None:
                 publish_mqtt("load/instant_power", load_power)
+        
+        # Get and publish battery level (percentage)
+        battery_level = safe_pw_call(pw.level)
+        if battery_level is not None:
+            publish_mqtt("battery/level", battery_level)
     
     except Exception as e:
         # Silently handle errors - MQTT should not break the proxy
