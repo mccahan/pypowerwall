@@ -134,7 +134,7 @@ def decompress_response(content: bytes) -> bytes:
 # TEDAPI Class
 class TEDAPI:
     def __init__(self, gw_pwd: str, debug: bool = False, pwcacheexpire: int = 5, timeout: int = 5, 
-                 pwconfigexpire: int = 5, host: str = GW_IP, poolmaxsize: int = 10,) -> None:
+                 pwconfigexpire: int = 180, host: str = GW_IP, poolmaxsize: int = 10,) -> None:
         """Initialize the TEDAPI client for Powerwall Gateway communication."""
         self.debug = debug
         self.pwcachetime = {}  # holds the cached data timestamps for api
