@@ -1072,6 +1072,696 @@ if control_secret:
         control_secret = None
 
 
+# ===================================================================
+# Route Handlers - Extract endpoint logic for better maintainability
+# ===================================================================
+# 
+# These route handler functions extract complex endpoint logic from the
+# monolithic do_GET method into focused, testable functions. Each handler
+# is responsible for a specific endpoint or group of related endpoints.
+#
+# Benefits:
+# - Improved code organization and readability
+# - Easier testing and debugging
+# - Better separation of concerns
+# - Simplified do_GET method
+#
+# Route handlers use the following helpers:
+# - safe_pw_call() - Safely call pypowerwall functions with error handling
+# - safe_endpoint_call() - Call endpoints with caching and graceful degradation
+# - cached_route_handler() - Add performance caching to route responses
+# ===================================================================
+
+def handle_aggregates_route():
+    """Handle /aggregates and /api/meters/aggregates endpoints."""
+    def generate_aggregates():
+        # Both routes deliver same payload, use shared cache key
+        aggregates = safe_endpoint_call(
+            "/aggregates", pw.poll, "/api/meters/aggregates"
+        )
+
+        # Parse aggregates if it's a JSON string
+        if isinstance(aggregates, str):
+            try:
+                aggregates = json.loads(aggregates)
+            except (json.JSONDecodeError, TypeError):
+                aggregates = None
+
+        if aggregates and not neg_solar and "solar" in aggregates:
+            solar = aggregates["solar"]
+            if solar and "instant_power" in solar and solar["instant_power"] < 0:
+                # Shift energy from solar to load
+                if "load" in aggregates and "instant_power" in aggregates["load"]:
+                    aggregates["load"]["instant_power"] -= solar["instant_power"]
+                # Finally, clamp solar to 0
+                solar["instant_power"] = 0
+
+        try:
+            if aggregates:
+                return json.dumps(aggregates)
+            else:
+                # No data available - return None to indicate stale/missing data
+                return None
+        except:
+            log.error(f"JSON encoding error in payload: {aggregates}")
+            return None
+
+    return cached_route_handler("/aggregates", generate_aggregates)
+
+
+def handle_soe_route():
+    """Handle /soe endpoint - Battery Level JSON."""
+    return safe_endpoint_call(
+        "/soe", pw.poll, "/api/system_status/soe", jsonformat=True
+    )
+
+
+def handle_api_system_status_soe_route():
+    """Handle /api/system_status/soe endpoint - Force 95% Scale."""
+    level = safe_pw_call(pw.level, scale=True)
+    return json.dumps({"percentage": level}) if level is not None else None
+
+
+def handle_api_system_status_grid_status_route():
+    """Handle /api/system_status/grid_status endpoint."""
+    return safe_pw_call(
+        pw.poll, "/api/system_status/grid_status", jsonformat=True
+    )
+
+
+def handle_csv_route(request_path):
+    """
+    Handle /csv and /csv/v2 endpoints.
+    Returns CSV formatted power data.
+    """
+    # Determine endpoint and whether to include headers
+    is_v2 = request_path.startswith("/csv/v2")
+    include_headers = "headers" in request_path
+    cache_key = f"/csv/v2{'_headers' if include_headers else ''}" if is_v2 else f"/csv{'_headers' if include_headers else ''}"
+    
+    def generate_csv():
+        # Optimization: Use single aggregates call for all power values
+        aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
+        if aggregates:
+            grid = aggregates.get('site', {}).get('instant_power', 0)
+            solar = aggregates.get('solar', {}).get('instant_power', 0)
+            battery = aggregates.get('battery', {}).get('instant_power', 0)
+            home = aggregates.get('load', {}).get('instant_power', 0)
+        else:
+            grid = solar = battery = home = 0
+        
+        # Apply negative solar correction if configured
+        if not neg_solar and solar < 0:
+            # Shift energy from solar to load
+            home -= solar
+            solar = 0
+        
+        # Get battery level - poll() handles caching internally
+        batterylevel = safe_pw_call(pw.level) or 0
+        
+        if is_v2:
+            # Get grid status and reserve - these use cached data internally
+            gridstatus = 1 if safe_pw_call(pw.grid_status) == "UP" else 0
+            reserve = safe_pw_call(pw.get_reserve) or 0
+        
+        # Build CSV response
+        if is_v2:
+            result = ""
+            if include_headers:
+                result += (
+                    "Grid,Home,Solar,Battery,BatteryLevel,GridStatus,Reserve\n"
+                )
+            result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%d,%d\n" % (
+                grid,
+                home,
+                solar,
+                battery,
+                batterylevel,
+                gridstatus,
+                reserve,
+            )
+        else:
+            result = ""
+            if include_headers:
+                result += "Grid,Home,Solar,Battery,BatteryLevel\n"
+            result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\n" % (
+                grid,
+                home,
+                solar,
+                battery,
+                batterylevel,
+            )
+        return result
+    
+    return cached_route_handler(cache_key, generate_csv)
+
+
+def handle_vitals_route():
+    """Handle /vitals endpoint - Vitals Data JSON."""
+    return cached_route_handler(
+        "/vitals",
+        lambda: safe_endpoint_call("/vitals", pw.vitals, jsonformat=True)
+    )
+
+
+def handle_strings_route():
+    """Handle /strings endpoint - Strings Data JSON."""
+    return cached_route_handler(
+        "/strings",
+        lambda: safe_endpoint_call("/strings", pw.strings, jsonformat=True)
+    )
+
+
+def handle_stats_route():
+    """Handle /stats endpoint - Internal statistics."""
+    with proxystats_lock:
+        proxystats["ts"] = int(time.time())
+        delta = proxystats["ts"] - proxystats["start"]
+        proxystats["uptime"] = str(datetime.timedelta(seconds=delta))
+        proxystats["mem"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        proxystats["site_name"] = safe_pw_call(pw.site_name)
+        proxystats["cloudmode"] = pw.cloudmode
+        proxystats["fleetapi"] = pw.fleetapi
+        if (pw.cloudmode or pw.fleetapi) and pw.client is not None:
+            proxystats["siteid"] = pw.client.siteid
+            proxystats["counter"] = pw.client.counter
+
+        # Add connection health stats if enabled
+        if health_check_enabled:
+            with _connection_health_lock:
+                proxystats["connection_health"] = {
+                    "consecutive_failures": _connection_health[
+                        "consecutive_failures"
+                    ],
+                    "total_failures": _connection_health["total_failures"],
+                    "total_successes": _connection_health["total_successes"],
+                    "is_degraded": _connection_health["is_degraded"],
+                    "last_success_time": _connection_health[
+                        "last_success_time"
+                    ],
+                    "cache_size": len(_last_good_responses)
+                    if graceful_degradation
+                    else 0,
+                }
+
+        # Add cache memory usage statistics
+        proxystats["mem_cache"] = {}
+
+        with _error_counts_lock:
+            proxystats["mem_cache"]["error_counts"] = {
+                "entries": len(_error_counts),
+                "size_bytes": sys.getsizeof(_error_counts) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) 
+                    for k, v in _error_counts.items()
+                ),
+            }
+            proxystats["mem_cache"]["network_error_summary"] = {
+                "entries": len(_network_error_summary),
+                "size_bytes": sys.getsizeof(_network_error_summary) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sum(
+                        sys.getsizeof(ek) + sys.getsizeof(ev) 
+                        for ek, ev in v.items()
+                    ) for k, v in _network_error_summary.items()
+                ),
+            }
+
+        with _last_good_responses_lock:
+            proxystats["mem_cache"]["degradation_cache"] = {
+                "entries": len(_last_good_responses),
+                "size_bytes": sys.getsizeof(_last_good_responses) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
+                    for k, v in _last_good_responses.items()
+                ),
+            }
+
+        with _performance_cache_lock:
+            proxystats["mem_cache"]["performance_cache"] = {
+                "entries": len(_performance_cache),
+                "size_bytes": sys.getsizeof(_performance_cache) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
+                    for k, v in _performance_cache.items()
+                ),
+            }
+
+        with _endpoint_stats_lock:
+            proxystats["mem_cache"]["endpoint_stats"] = {
+                "entries": len(_endpoint_stats),
+                "size_bytes": sys.getsizeof(_endpoint_stats) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sum(
+                        sys.getsizeof(ek) + sys.getsizeof(ev) 
+                        for ek, ev in v.items()
+                    ) for k, v in _endpoint_stats.items()
+                ),
+            }
+
+        # Add total cache memory usage
+        total_cache_bytes = sum(
+            cache_info["size_bytes"] for cache_info in proxystats["mem_cache"].values()
+        )
+        proxystats["mem_cache"]["total_cache_bytes"] = total_cache_bytes
+        proxystats["mem_cache"]["total_cache_mb"] = round(total_cache_bytes / 1024 / 1024, 2)
+
+        return json.dumps(proxystats)
+
+
+def handle_stats_clear_route():
+    """Handle /stats/clear endpoint."""
+    log.debug("Clear internal stats")
+    with proxystats_lock:
+        proxystats["gets"] = 0
+        proxystats["errors"] = 0
+        proxystats["uri"] = {}
+        proxystats["clear"] = int(time.time())
+    return json.dumps(proxystats)
+
+
+def handle_health_route():
+    """Handle /health endpoint - Connection Health and Cache Status."""
+    health_info = {
+        "pypowerwall": "%s Proxy %s" % (pypowerwall.version, BUILD),
+        "pypowerwall_cache_expire": cache_expire,
+        "degradation_cache_ttl_seconds": degradation_cache_ttl_seconds,
+        "graceful_degradation": graceful_degradation,
+        "fail_fast_mode": fail_fast_mode,
+        "health_check_enabled": health_check_enabled,
+        "startup_time": datetime.datetime.fromtimestamp(
+            proxystats["start"]
+        ).isoformat(),
+        "current_time": datetime.datetime.now().isoformat(),
+    }
+
+    # Add overall proxy response counters
+    with proxystats_lock:
+        health_info["proxy_stats"] = {
+            "total_gets": proxystats["gets"],
+            "total_posts": proxystats["posts"],
+            "total_errors": proxystats["errors"],
+            "total_timeouts": proxystats["timeout"],
+        }
+
+    if health_check_enabled:
+        with _connection_health_lock:
+            health_info["connection_health"] = {
+                "consecutive_failures": _connection_health[
+                    "consecutive_failures"
+                ],
+                "total_failures": _connection_health["total_failures"],
+                "total_successes": _connection_health["total_successes"],
+                "is_degraded": _connection_health["is_degraded"],
+                "last_success_time": _connection_health["last_success_time"],
+                "last_success_age_seconds": time.time()
+                - _connection_health["last_success_time"],
+            }
+
+    if graceful_degradation:
+        with _last_good_responses_lock:
+            cached_endpoints = {}
+            current_time = time.time()
+            for endpoint, (data, timestamp) in _last_good_responses.items():
+                age = current_time - timestamp
+                cached_endpoints[endpoint] = {
+                    "age_seconds": age,
+                    "is_expired": age >= degradation_cache_ttl_seconds,
+                }
+            health_info["cached_data"] = {
+                "cache_size": len(_last_good_responses),
+                "endpoints": cached_endpoints,
+            }
+
+    # Add endpoint call statistics
+    with _endpoint_stats_lock:
+        endpoint_stats = {}
+        current_time = time.time()
+        for endpoint, stats in _endpoint_stats.items():
+            success_rate = (
+                (stats["successful_calls"] / stats["total_calls"] * 100)
+                if stats["total_calls"] > 0
+                else 0
+            )
+            endpoint_info = {
+                "total_calls": stats["total_calls"],
+                "successful_calls": stats["successful_calls"],
+                "failed_calls": stats["failed_calls"],
+                "success_rate_percent": round(success_rate, 2),
+            }
+
+            if stats["last_success_time"]:
+                endpoint_info["last_success_age_seconds"] = (
+                    current_time - stats["last_success_time"]
+                )
+            if stats["last_failure_time"]:
+                endpoint_info["last_failure_age_seconds"] = (
+                    current_time - stats["last_failure_time"]
+                )
+
+            endpoint_stats[endpoint] = endpoint_info
+
+        if endpoint_stats:
+            health_info["endpoint_statistics"] = endpoint_stats
+
+    # Add MQTT status if enabled
+    if mqtt_enabled:
+        with proxystats_lock:
+            health_info["mqtt_status"] = {
+                "enabled": mqtt_enabled,
+                "connected": proxystats["mqtt_connected"],
+                "publish_count": proxystats["mqtt_publish_count"],
+                "error_count": proxystats["mqtt_error_count"],
+                "broker": f"{mqtt_host}:{mqtt_port}",
+                "topic_prefix": mqtt_topic_prefix,
+            }
+
+    return json.dumps(health_info)
+
+
+def handle_health_reset_route():
+    """Handle /health/reset endpoint."""
+    cache_size_before = 0
+
+    if health_check_enabled:
+        with _connection_health_lock:
+            _connection_health["consecutive_failures"] = 0
+            _connection_health["total_failures"] = 0
+            _connection_health["total_successes"] = 0
+            _connection_health["is_degraded"] = False
+            _connection_health["last_success_time"] = time.time()
+
+    if graceful_degradation:
+        with _last_good_responses_lock:
+            cache_size_before = len(_last_good_responses)
+            _last_good_responses.clear()
+
+    # Reset endpoint statistics
+    endpoint_stats_count = 0
+    with _endpoint_stats_lock:
+        endpoint_stats_count = len(_endpoint_stats)
+        _endpoint_stats.clear()
+
+    log.info(
+        "Health counters, cache, and endpoint statistics reset via /health/reset endpoint"
+    )
+    return json.dumps(
+        {
+            "status": "reset_complete",
+            "health_counters_reset": health_check_enabled,
+            "cache_cleared": graceful_degradation,
+            "cache_entries_removed": cache_size_before
+            if graceful_degradation
+            else 0,
+            "endpoint_stats_cleared": endpoint_stats_count,
+        }
+    )
+
+
+def handle_temps_route():
+    """Handle /temps endpoint."""
+    return safe_pw_call(pw.temps, jsonformat=True) or json.dumps({})
+
+
+def handle_temps_pw_route():
+    """Handle /temps/pw endpoint - Temps with Simple Keys."""
+    def generate_temps_pw():
+        pwtemp = {}
+        idx = 1
+        temps = safe_pw_call(pw.temps)
+        if temps:
+            for i in temps:
+                key = "PW%d_temp" % idx
+                pwtemp[key] = temps[i]
+                idx = idx + 1
+        return json.dumps(pwtemp)
+    
+    return cached_route_handler("/temps/pw", generate_temps_pw)
+
+
+def handle_alerts_route():
+    """Handle /alerts endpoint."""
+    return safe_pw_call(pw.alerts, jsonformat=True) or json.dumps([])
+
+
+def handle_alerts_pw_route():
+    """Handle /alerts/pw endpoint - Alerts in dictionary/object format."""
+    def generate_alerts_pw():
+        pwalerts = {}
+        alerts = safe_pw_call(pw.alerts)
+        if alerts is None:
+            return None
+        else:
+            for alert in alerts:
+                pwalerts[alert] = 1
+            return json.dumps(pwalerts) or json.dumps({})
+    
+    return cached_route_handler("/alerts/pw", generate_alerts_pw)
+
+
+def handle_freq_route():
+    """Handle /freq endpoint - Frequency, Current, Voltage and Grid Status."""
+    def generate_freq():
+        fcv = {}
+        idx = 1
+        # Pull freq, current, voltage of each Powerwall via system_status
+        d = safe_pw_call(pw.system_status) or {}
+        if "battery_blocks" in d:
+            for block in d["battery_blocks"]:
+                fcv["PW%d_name" % idx] = None  # Placeholder for vitals
+                fcv["PW%d_PINV_Fout" % idx] = get_value(block, "f_out")
+                fcv["PW%d_PINV_VSplit1" % idx] = None  # Placeholder for vitals
+                fcv["PW%d_PINV_VSplit2" % idx] = None  # Placeholder for vitals
+                fcv["PW%d_PackagePartNumber" % idx] = get_value(
+                    block, "PackagePartNumber"
+                )
+                fcv["PW%d_PackageSerialNumber" % idx] = get_value(
+                    block, "PackageSerialNumber"
+                )
+                fcv["PW%d_p_out" % idx] = get_value(block, "p_out")
+                fcv["PW%d_q_out" % idx] = get_value(block, "q_out")
+                fcv["PW%d_v_out" % idx] = get_value(block, "v_out")
+                fcv["PW%d_f_out" % idx] = get_value(block, "f_out")
+                fcv["PW%d_i_out" % idx] = get_value(block, "i_out")
+                idx = idx + 1
+        # Pull freq, current, voltage of each Powerwall via vitals if available
+        vitals = safe_pw_call(pw.vitals) or {}
+        idx = 1
+        for device in vitals:
+            d = vitals[device]
+            if device.startswith("TEPINV"):
+                # PW freq
+                fcv["PW%d_name" % idx] = device
+                fcv["PW%d_PINV_Fout" % idx] = get_value(d, "PINV_Fout")
+                fcv["PW%d_PINV_VSplit1" % idx] = get_value(d, "PINV_VSplit1")
+                fcv["PW%d_PINV_VSplit2" % idx] = get_value(d, "PINV_VSplit2")
+                idx = idx + 1
+            if device.startswith("TESYNC") or device.startswith("TEMSA"):
+                # Island and Meter Metrics from Backup Gateway or Backup Switch
+                for i in d:
+                    if i.startswith("ISLAND") or i.startswith("METER"):
+                        fcv[i] = d[i]
+        fcv["grid_status"] = safe_pw_call(pw.grid_status, "numeric")
+        return json.dumps(fcv)
+    
+    return cached_route_handler("/freq", generate_freq)
+
+
+def handle_pod_route():
+    """Handle /pod endpoint - Powerwall Battery Data."""
+    def generate_pod():
+        pod = {}
+        # Get Individual Powerwall Battery Data
+        d = safe_pw_call(pw.system_status) or {}
+        if "battery_blocks" in d:
+            idx = 1
+            for block in d["battery_blocks"]:
+                # Vital Placeholders
+                pod["PW%d_name" % idx] = None
+                pod["PW%d_POD_ActiveHeating" % idx] = None
+                pod["PW%d_POD_ChargeComplete" % idx] = None
+                pod["PW%d_POD_ChargeRequest" % idx] = None
+                pod["PW%d_POD_DischargeComplete" % idx] = None
+                pod["PW%d_POD_PermanentlyFaulted" % idx] = None
+                pod["PW%d_POD_PersistentlyFaulted" % idx] = None
+                pod["PW%d_POD_enable_line" % idx] = None
+                pod["PW%d_POD_available_charge_power" % idx] = None
+                pod["PW%d_POD_available_dischg_power" % idx] = None
+                pod["PW%d_POD_nom_energy_remaining" % idx] = None
+                pod["PW%d_POD_nom_energy_to_be_charged" % idx] = None
+                pod["PW%d_POD_nom_full_pack_energy" % idx] = None
+                # Additional System Status Data
+                pod["PW%d_POD_nom_energy_remaining" % idx] = get_value(
+                    block, "nominal_energy_remaining"
+                )  # map
+                pod["PW%d_POD_nom_full_pack_energy" % idx] = get_value(
+                    block, "nominal_full_pack_energy"
+                )  # map
+                pod["PW%d_PackagePartNumber" % idx] = get_value(
+                    block, "PackagePartNumber"
+                )
+                pod["PW%d_PackageSerialNumber" % idx] = get_value(
+                    block, "PackageSerialNumber"
+                )
+                pod["PW%d_pinv_state" % idx] = get_value(block, "pinv_state")
+                pod["PW%d_pinv_grid_state" % idx] = get_value(
+                    block, "pinv_grid_state"
+                )
+                pod["PW%d_p_out" % idx] = get_value(block, "p_out")
+                pod["PW%d_q_out" % idx] = get_value(block, "q_out")
+                pod["PW%d_v_out" % idx] = get_value(block, "v_out")
+                pod["PW%d_f_out" % idx] = get_value(block, "f_out")
+                pod["PW%d_i_out" % idx] = get_value(block, "i_out")
+                pod["PW%d_energy_charged" % idx] = get_value(
+                    block, "energy_charged"
+                )
+                pod["PW%d_energy_discharged" % idx] = get_value(
+                    block, "energy_discharged"
+                )
+                pod["PW%d_off_grid" % idx] = int(get_value(block, "off_grid") or 0)
+                pod["PW%d_vf_mode" % idx] = int(get_value(block, "vf_mode") or 0)
+                pod["PW%d_wobble_detected" % idx] = int(
+                    get_value(block, "wobble_detected") or 0
+                )
+                pod["PW%d_charge_power_clamped" % idx] = int(
+                    get_value(block, "charge_power_clamped") or 0
+                )
+                pod["PW%d_backup_ready" % idx] = int(
+                    get_value(block, "backup_ready") or 0
+                )
+                pod["PW%d_OpSeqState" % idx] = get_value(block, "OpSeqState")
+                pod["PW%d_version" % idx] = get_value(block, "version")
+                idx = idx + 1
+        # Augment with Vitals Data if available
+        vitals = safe_pw_call(pw.vitals) or {}
+        idx = 1
+        for device in vitals:
+            v = vitals[device]
+            if device.startswith("TEPOD"):
+                pod["PW%d_name" % idx] = device
+                pod["PW%d_POD_ActiveHeating" % idx] = int(
+                    get_value(v, "POD_ActiveHeating") or 0
+                )
+                pod["PW%d_POD_ChargeComplete" % idx] = int(
+                    get_value(v, "POD_ChargeComplete") or 0
+                )
+                pod["PW%d_POD_ChargeRequest" % idx] = int(
+                    get_value(v, "POD_ChargeRequest") or 0
+                )
+                pod["PW%d_POD_DischargeComplete" % idx] = int(
+                    get_value(v, "POD_DischargeComplete") or 0
+                )
+                pod["PW%d_POD_PermanentlyFaulted" % idx] = int(
+                    get_value(v, "POD_PermanentlyFaulted") or 0
+                )
+                pod["PW%d_POD_PersistentlyFaulted" % idx] = int(
+                    get_value(v, "POD_PersistentlyFaulted") or 0
+                )
+                pod["PW%d_POD_enable_line" % idx] = int(
+                    get_value(v, "POD_enable_line") or 0
+                )
+                pod["PW%d_POD_available_charge_power" % idx] = get_value(
+                    v, "POD_available_charge_power"
+                )
+                pod["PW%d_POD_available_dischg_power" % idx] = get_value(
+                    v, "POD_available_dischg_power"
+                )
+                pod["PW%d_POD_nom_energy_remaining" % idx] = get_value(
+                    v, "POD_nom_energy_remaining"
+                )
+                pod["PW%d_POD_nom_energy_to_be_charged" % idx] = get_value(
+                    v, "POD_nom_energy_to_be_charged"
+                )
+                pod["PW%d_POD_nom_full_pack_energy" % idx] = get_value(
+                    v, "POD_nom_full_pack_energy"
+                )
+                idx = idx + 1
+        # Note: Expansion packs are now included in vitals() as TEPOD entries,
+        # so they're automatically picked up by the loop above.
+        # Aggregate data
+        pod["nominal_full_pack_energy"] = get_value(d, "nominal_full_pack_energy")
+        pod["nominal_energy_remaining"] = get_value(d, "nominal_energy_remaining")
+        pod["time_remaining_hours"] = safe_pw_call(pw.get_time_remaining)
+        pod["backup_reserve_percent"] = safe_pw_call(pw.get_reserve)
+        return json.dumps(pod)
+    
+    return cached_route_handler("/pod", generate_pod)
+
+
+def handle_json_route():
+    """Handle /json endpoint - JSON format of grid, home, solar, battery, etc."""
+    def generate_json():
+        # Optimization: Use single aggregates call for all power values (like CSV endpoint)
+        aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
+        if aggregates:
+            grid = aggregates.get('site', {}).get('instant_power', 0)
+            solar = aggregates.get('solar', {}).get('instant_power', 0)
+            battery = aggregates.get('battery', {}).get('instant_power', 0)
+            home = aggregates.get('load', {}).get('instant_power', 0)
+        else:
+            grid = solar = battery = home = 0
+        
+        # Apply negative solar correction if configured
+        if not neg_solar and solar < 0:
+            # Shift energy from solar to load
+            home -= solar
+            solar = 0
+        
+        # Get remaining data
+        d = safe_pw_call(pw.system_status) or {}
+        values = {
+            "grid": grid,
+            "home": home,
+            "solar": solar,
+            "battery": battery,
+            "soe": safe_pw_call(pw.level) or 0,
+            "grid_status": int(safe_pw_call(pw.grid_status) == "UP"),
+            "reserve": safe_pw_call(pw.get_reserve) or 0,
+            "time_remaining_hours": safe_pw_call(pw.get_time_remaining) or 0,
+            "full_pack_energy": get_value(d, "nominal_full_pack_energy") or 0,
+            "energy_remaining": get_value(d, "nominal_energy_remaining") or 0,
+            "strings": safe_pw_call(pw.strings, jsonformat=False) or {},
+        }
+        return json.dumps(values)
+    
+    return cached_route_handler("/json", generate_json)
+
+
+def handle_version_route():
+    """Handle /version endpoint - Firmware Version."""
+    version = safe_pw_call(pw.version)
+    v = {}
+    if version is None:
+        v["version"] = "SolarOnly"
+        v["vint"] = 0
+        return json.dumps(v)
+    else:
+        v["version"] = version
+        v["vint"] = parse_version(version)
+        return json.dumps(v)
+
+
+def handle_stats_clear_route():
+    """Handle /alerts/pw endpoint - Alerts in dictionary/object format."""
+    def generate_alerts_pw():
+        pwalerts = {}
+        alerts = safe_pw_call(pw.alerts)
+        if alerts is None:
+            return None
+        else:
+            for alert in alerts:
+                pwalerts[alert] = 1
+            return json.dumps(pwalerts) or json.dumps({})
+    
+    return cached_route_handler("/alerts/pw", generate_alerts_pw)
+
+
+def handle_stats_clear_route():
+    """Handle /stats/clear endpoint."""
+    log.debug("Clear internal stats")
+    with proxystats_lock:
+        proxystats["gets"] = 0
+        proxystats["errors"] = 0
+        proxystats["uri"] = {}
+        proxystats["clear"] = int(time.time())
+    return json.dumps(proxystats)
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -1252,615 +1942,44 @@ class Handler(BaseHTTPRequestHandler):
             request_path = "/" + new_path
 
         if request_path == "/aggregates" or request_path == "/api/meters/aggregates":
-            # Meters - JSON
-            def generate_aggregates():
-                # Both routes deliver same payload, use shared cache key
-                aggregates = safe_endpoint_call(
-                    "/aggregates", pw.poll, "/api/meters/aggregates"
-                )
-
-                # Parse aggregates if it's a JSON string
-                if isinstance(aggregates, str):
-                    try:
-                        aggregates = json.loads(aggregates)
-                    except (json.JSONDecodeError, TypeError):
-                        aggregates = None
-
-                if aggregates and not neg_solar and "solar" in aggregates:
-                    solar = aggregates["solar"]
-                    if solar and "instant_power" in solar and solar["instant_power"] < 0:
-                        # Shift energy from solar to load
-                        if "load" in aggregates and "instant_power" in aggregates["load"]:
-                            aggregates["load"]["instant_power"] -= solar["instant_power"]
-                        # Finally, clamp solar to 0
-                        solar["instant_power"] = 0
-
-                try:
-                    if aggregates:
-                        return json.dumps(aggregates)
-                    else:
-                        # No data available - return None to indicate stale/missing data
-                        return None
-                except:
-                    log.error(f"JSON encoding error in payload: {aggregates}")
-                    return None
-
-            message = cached_route_handler("/aggregates", generate_aggregates)
+            message = handle_aggregates_route()
         elif request_path == "/soe":
-            # Battery Level - JSON
-            message: str = safe_endpoint_call(
-                "/soe", pw.poll, "/api/system_status/soe", jsonformat=True
-            )
-            # Return None if no current data available (better than fake 0%)
+            message: str = handle_soe_route()
         elif request_path == "/api/system_status/soe":
-            # Force 95% Scale
-            level = safe_pw_call(pw.level, scale=True)
-            message: str = (
-                json.dumps({"percentage": level}) if level is not None else None
-            )
+            message: str = handle_api_system_status_soe_route()
         elif request_path == "/api/system_status/grid_status":
-            # Grid Status - JSON
-            message: str = safe_pw_call(
-                pw.poll, "/api/system_status/grid_status", jsonformat=True
-            )
+            message: str = handle_api_system_status_grid_status_route()
         elif request_path.startswith("/csv") or request_path.startswith("/csv/v2"):
-            # CSV Output - Grid,Home,Solar,Battery,Level
-            # CSV2 Output - Grid,Home,Solar,Battery,Level,GridStatus,Reserve
-            # Add ?headers to include CSV headers, e.g. http://localhost:8675/csv?headers
             contenttype = "text/plain; charset=utf-8"
-            
-            # Determine endpoint and whether to include headers
-            is_v2 = request_path.startswith("/csv/v2")
-            include_headers = "headers" in request_path
-            cache_key = f"/csv/v2{'_headers' if include_headers else ''}" if is_v2 else f"/csv{'_headers' if include_headers else ''}"
-            
-            def generate_csv():
-                # Optimization: Use single aggregates call for all power values
-                aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
-                if aggregates:
-                    grid = aggregates.get('site', {}).get('instant_power', 0)
-                    solar = aggregates.get('solar', {}).get('instant_power', 0)
-                    battery = aggregates.get('battery', {}).get('instant_power', 0)
-                    home = aggregates.get('load', {}).get('instant_power', 0)
-                else:
-                    grid = solar = battery = home = 0
-                
-                # Apply negative solar correction if configured
-                if not neg_solar and solar < 0:
-                    # Shift energy from solar to load
-                    home -= solar
-                    solar = 0
-                
-                # Get battery level - poll() handles caching internally
-                batterylevel = safe_pw_call(pw.level) or 0
-                
-                if is_v2:
-                    # Get grid status and reserve - these use cached data internally
-                    gridstatus = 1 if safe_pw_call(pw.grid_status) == "UP" else 0
-                    reserve = safe_pw_call(pw.get_reserve) or 0
-                
-                # Build CSV response
-                if is_v2:
-                    result = ""
-                    if include_headers:
-                        result += (
-                            "Grid,Home,Solar,Battery,BatteryLevel,GridStatus,Reserve\n"
-                        )
-                    result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%d,%d\n" % (
-                        grid,
-                        home,
-                        solar,
-                        battery,
-                        batterylevel,
-                        gridstatus,
-                        reserve,
-                    )
-                else:
-                    result = ""
-                    if include_headers:
-                        result += "Grid,Home,Solar,Battery,BatteryLevel\n"
-                    result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\n" % (
-                        grid,
-                        home,
-                        solar,
-                        battery,
-                        batterylevel,
-                    )
-                return result
-            
-            message = cached_route_handler(cache_key, generate_csv)
+            message = handle_csv_route(request_path)
         elif request_path == "/vitals":
-            # Vitals Data - JSON
-            message = cached_route_handler(
-                "/vitals",
-                lambda: safe_endpoint_call("/vitals", pw.vitals, jsonformat=True)
-            )
+            message = handle_vitals_route()
         elif request_path == "/strings":
-            # Strings Data - JSON
-            message = cached_route_handler(
-                "/strings",
-                lambda: safe_endpoint_call("/strings", pw.strings, jsonformat=True)
-            )
+            message = handle_strings_route()
         elif request_path == "/stats":
-            # Give Internal Stats
-            with proxystats_lock:
-                proxystats["ts"] = int(time.time())
-                delta = proxystats["ts"] - proxystats["start"]
-                proxystats["uptime"] = str(datetime.timedelta(seconds=delta))
-                proxystats["mem"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                proxystats["site_name"] = safe_pw_call(pw.site_name)
-                proxystats["cloudmode"] = pw.cloudmode
-                proxystats["fleetapi"] = pw.fleetapi
-                if (pw.cloudmode or pw.fleetapi) and pw.client is not None:
-                    proxystats["siteid"] = pw.client.siteid
-                    proxystats["counter"] = pw.client.counter
-
-                # Add connection health stats if enabled
-                if health_check_enabled:
-                    with _connection_health_lock:
-                        proxystats["connection_health"] = {
-                            "consecutive_failures": _connection_health[
-                                "consecutive_failures"
-                            ],
-                            "total_failures": _connection_health["total_failures"],
-                            "total_successes": _connection_health["total_successes"],
-                            "is_degraded": _connection_health["is_degraded"],
-                            "last_success_time": _connection_health[
-                                "last_success_time"
-                            ],
-                            "cache_size": len(_last_good_responses)
-                            if graceful_degradation
-                            else 0,
-                        }
-
-                # Add cache memory usage statistics
-                proxystats["mem_cache"] = {}
-
-                with _error_counts_lock:
-                    proxystats["mem_cache"]["error_counts"] = {
-                        "entries": len(_error_counts),
-                        "size_bytes": sys.getsizeof(_error_counts) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) 
-                            for k, v in _error_counts.items()
-                        ),
-                    }
-                    proxystats["mem_cache"]["network_error_summary"] = {
-                        "entries": len(_network_error_summary),
-                        "size_bytes": sys.getsizeof(_network_error_summary) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sum(
-                                sys.getsizeof(ek) + sys.getsizeof(ev) 
-                                for ek, ev in v.items()
-                            ) for k, v in _network_error_summary.items()
-                        ),
-                    }
-
-                with _last_good_responses_lock:
-                    proxystats["mem_cache"]["degradation_cache"] = {
-                        "entries": len(_last_good_responses),
-                        "size_bytes": sys.getsizeof(_last_good_responses) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
-                            for k, v in _last_good_responses.items()
-                        ),
-                    }
-
-                with _performance_cache_lock:
-                    proxystats["mem_cache"]["performance_cache"] = {
-                        "entries": len(_performance_cache),
-                        "size_bytes": sys.getsizeof(_performance_cache) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
-                            for k, v in _performance_cache.items()
-                        ),
-                    }
-
-                with _endpoint_stats_lock:
-                    proxystats["mem_cache"]["endpoint_stats"] = {
-                        "entries": len(_endpoint_stats),
-                        "size_bytes": sys.getsizeof(_endpoint_stats) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sum(
-                                sys.getsizeof(ek) + sys.getsizeof(ev) 
-                                for ek, ev in v.items()
-                            ) for k, v in _endpoint_stats.items()
-                        ),
-                    }
-
-                # Add total cache memory usage
-                total_cache_bytes = sum(
-                    cache_info["size_bytes"] for cache_info in proxystats["mem_cache"].values()
-                )
-                proxystats["mem_cache"]["total_cache_bytes"] = total_cache_bytes
-                proxystats["mem_cache"]["total_cache_mb"] = round(total_cache_bytes / 1024 / 1024, 2)
-
-                message: str = json.dumps(proxystats)
+            message: str = handle_stats_route()
         elif request_path == "/stats/clear":
-            # Clear Internal Stats
-            log.debug("Clear internal stats")
-            with proxystats_lock:
-                proxystats["gets"] = 0
-                proxystats["errors"] = 0
-                proxystats["uri"] = {}
-                proxystats["clear"] = int(time.time())
-            message: str = json.dumps(proxystats)
+            message: str = handle_stats_clear_route()
         elif request_path == "/health":
-            # Connection Health and Cache Status
-            health_info = {
-                "pypowerwall": "%s Proxy %s" % (pypowerwall.version, BUILD),
-                "pypowerwall_cache_expire": cache_expire,
-                "degradation_cache_ttl_seconds": degradation_cache_ttl_seconds,
-                "graceful_degradation": graceful_degradation,
-                "fail_fast_mode": fail_fast_mode,
-                "health_check_enabled": health_check_enabled,
-                "startup_time": datetime.datetime.fromtimestamp(
-                    proxystats["start"]
-                ).isoformat(),
-                "current_time": datetime.datetime.now().isoformat(),
-            }
-
-            # Add overall proxy response counters
-            with proxystats_lock:
-                health_info["proxy_stats"] = {
-                    "total_gets": proxystats["gets"],
-                    "total_posts": proxystats["posts"],
-                    "total_errors": proxystats["errors"],
-                    "total_timeouts": proxystats["timeout"],
-                }
-
-            if health_check_enabled:
-                with _connection_health_lock:
-                    health_info["connection_health"] = {
-                        "consecutive_failures": _connection_health[
-                            "consecutive_failures"
-                        ],
-                        "total_failures": _connection_health["total_failures"],
-                        "total_successes": _connection_health["total_successes"],
-                        "is_degraded": _connection_health["is_degraded"],
-                        "last_success_time": _connection_health["last_success_time"],
-                        "last_success_age_seconds": time.time()
-                        - _connection_health["last_success_time"],
-                    }
-
-            if graceful_degradation:
-                with _last_good_responses_lock:
-                    cached_endpoints = {}
-                    current_time = time.time()
-                    for endpoint, (data, timestamp) in _last_good_responses.items():
-                        age = current_time - timestamp
-                        cached_endpoints[endpoint] = {
-                            "age_seconds": age,
-                            "is_expired": age >= degradation_cache_ttl_seconds,
-                        }
-                    health_info["cached_data"] = {
-                        "cache_size": len(_last_good_responses),
-                        "endpoints": cached_endpoints,
-                    }
-
-            # Add endpoint call statistics
-            with _endpoint_stats_lock:
-                endpoint_stats = {}
-                current_time = time.time()
-                for endpoint, stats in _endpoint_stats.items():
-                    success_rate = (
-                        (stats["successful_calls"] / stats["total_calls"] * 100)
-                        if stats["total_calls"] > 0
-                        else 0
-                    )
-                    endpoint_info = {
-                        "total_calls": stats["total_calls"],
-                        "successful_calls": stats["successful_calls"],
-                        "failed_calls": stats["failed_calls"],
-                        "success_rate_percent": round(success_rate, 2),
-                    }
-
-                    if stats["last_success_time"]:
-                        endpoint_info["last_success_age_seconds"] = (
-                            current_time - stats["last_success_time"]
-                        )
-                    if stats["last_failure_time"]:
-                        endpoint_info["last_failure_age_seconds"] = (
-                            current_time - stats["last_failure_time"]
-                        )
-
-                    endpoint_stats[endpoint] = endpoint_info
-
-                if endpoint_stats:
-                    health_info["endpoint_statistics"] = endpoint_stats
-
-            # Add MQTT status if enabled
-            if mqtt_enabled:
-                with proxystats_lock:
-                    health_info["mqtt_status"] = {
-                        "enabled": mqtt_enabled,
-                        "connected": proxystats["mqtt_connected"],
-                        "publish_count": proxystats["mqtt_publish_count"],
-                        "error_count": proxystats["mqtt_error_count"],
-                        "broker": f"{mqtt_host}:{mqtt_port}",
-                        "topic_prefix": mqtt_topic_prefix,
-                    }
-
-            message: str = json.dumps(health_info)
+            message: str = handle_health_route()
         elif request_path == "/health/reset":
-            # Reset Health Counters and Clear Cache
-            cache_size_before = 0
-
-            if health_check_enabled:
-                with _connection_health_lock:
-                    _connection_health["consecutive_failures"] = 0
-                    _connection_health["total_failures"] = 0
-                    _connection_health["total_successes"] = 0
-                    _connection_health["is_degraded"] = False
-                    _connection_health["last_success_time"] = time.time()
-
-            if graceful_degradation:
-                with _last_good_responses_lock:
-                    cache_size_before = len(_last_good_responses)
-                    _last_good_responses.clear()
-
-            # Reset endpoint statistics
-            endpoint_stats_count = 0
-            with _endpoint_stats_lock:
-                endpoint_stats_count = len(_endpoint_stats)
-                _endpoint_stats.clear()
-
-            log.info(
-                "Health counters, cache, and endpoint statistics reset via /health/reset endpoint"
-            )
-            message: str = json.dumps(
-                {
-                    "status": "reset_complete",
-                    "health_counters_reset": health_check_enabled,
-                    "cache_cleared": graceful_degradation,
-                    "cache_entries_removed": cache_size_before
-                    if graceful_degradation
-                    else 0,
-                    "endpoint_stats_cleared": endpoint_stats_count,
-                }
-            )
+            message: str = handle_health_reset_route()
         elif request_path == "/temps":
-            # Temps of Powerwalls
-            message: str = safe_pw_call(pw.temps, jsonformat=True) or json.dumps({})
+            message: str = handle_temps_route()
         elif request_path == "/temps/pw":
-            # Temps of Powerwalls with Simple Keys
-            def generate_temps_pw():
-                pwtemp = {}
-                idx = 1
-                temps = safe_pw_call(pw.temps)
-                if temps:
-                    for i in temps:
-                        key = "PW%d_temp" % idx
-                        pwtemp[key] = temps[i]
-                        idx = idx + 1
-                return json.dumps(pwtemp)
-            
-            message = cached_route_handler("/temps/pw", generate_temps_pw)
+            message = handle_temps_pw_route()
         elif request_path == "/alerts":
-            # Alerts
-            message: str = safe_pw_call(pw.alerts, jsonformat=True) or json.dumps([])
+            message: str = handle_alerts_route()
         elif request_path == "/alerts/pw":
-            # Alerts in dictionary/object format
-            def generate_alerts_pw():
-                pwalerts = {}
-                alerts = safe_pw_call(pw.alerts)
-                if alerts is None:
-                    return None
-                else:
-                    for alert in alerts:
-                        pwalerts[alert] = 1
-                    return json.dumps(pwalerts) or json.dumps({})
-            
-            message = cached_route_handler("/alerts/pw", generate_alerts_pw)
+            message = handle_alerts_pw_route()
         elif request_path == "/freq":
-            # Frequency, Current, Voltage and Grid Status
-            def generate_freq():
-                fcv = {}
-                idx = 1
-                # Pull freq, current, voltage of each Powerwall via system_status
-                d = safe_pw_call(pw.system_status) or {}
-                if "battery_blocks" in d:
-                    for block in d["battery_blocks"]:
-                        fcv["PW%d_name" % idx] = None  # Placeholder for vitals
-                        fcv["PW%d_PINV_Fout" % idx] = get_value(block, "f_out")
-                        fcv["PW%d_PINV_VSplit1" % idx] = None  # Placeholder for vitals
-                        fcv["PW%d_PINV_VSplit2" % idx] = None  # Placeholder for vitals
-                        fcv["PW%d_PackagePartNumber" % idx] = get_value(
-                            block, "PackagePartNumber"
-                        )
-                        fcv["PW%d_PackageSerialNumber" % idx] = get_value(
-                            block, "PackageSerialNumber"
-                        )
-                        fcv["PW%d_p_out" % idx] = get_value(block, "p_out")
-                        fcv["PW%d_q_out" % idx] = get_value(block, "q_out")
-                        fcv["PW%d_v_out" % idx] = get_value(block, "v_out")
-                        fcv["PW%d_f_out" % idx] = get_value(block, "f_out")
-                        fcv["PW%d_i_out" % idx] = get_value(block, "i_out")
-                        idx = idx + 1
-                # Pull freq, current, voltage of each Powerwall via vitals if available
-                vitals = safe_pw_call(pw.vitals) or {}
-                idx = 1
-                for device in vitals:
-                    d = vitals[device]
-                    if device.startswith("TEPINV"):
-                        # PW freq
-                        fcv["PW%d_name" % idx] = device
-                        fcv["PW%d_PINV_Fout" % idx] = get_value(d, "PINV_Fout")
-                        fcv["PW%d_PINV_VSplit1" % idx] = get_value(d, "PINV_VSplit1")
-                        fcv["PW%d_PINV_VSplit2" % idx] = get_value(d, "PINV_VSplit2")
-                        idx = idx + 1
-                    if device.startswith("TESYNC") or device.startswith("TEMSA"):
-                        # Island and Meter Metrics from Backup Gateway or Backup Switch
-                        for i in d:
-                            if i.startswith("ISLAND") or i.startswith("METER"):
-                                fcv[i] = d[i]
-                fcv["grid_status"] = safe_pw_call(pw.grid_status, "numeric")
-                return json.dumps(fcv)
-            
-            message = cached_route_handler("/freq", generate_freq)
+            message = handle_freq_route()
         elif request_path == "/pod":
-            # Powerwall Battery Data
-            def generate_pod():
-                pod = {}
-                # Get Individual Powerwall Battery Data
-                d = safe_pw_call(pw.system_status) or {}
-                if "battery_blocks" in d:
-                    idx = 1
-                    for block in d["battery_blocks"]:
-                        # Vital Placeholders
-                        pod["PW%d_name" % idx] = None
-                        pod["PW%d_POD_ActiveHeating" % idx] = None
-                        pod["PW%d_POD_ChargeComplete" % idx] = None
-                        pod["PW%d_POD_ChargeRequest" % idx] = None
-                        pod["PW%d_POD_DischargeComplete" % idx] = None
-                        pod["PW%d_POD_PermanentlyFaulted" % idx] = None
-                        pod["PW%d_POD_PersistentlyFaulted" % idx] = None
-                        pod["PW%d_POD_enable_line" % idx] = None
-                        pod["PW%d_POD_available_charge_power" % idx] = None
-                        pod["PW%d_POD_available_dischg_power" % idx] = None
-                        pod["PW%d_POD_nom_energy_remaining" % idx] = None
-                        pod["PW%d_POD_nom_energy_to_be_charged" % idx] = None
-                        pod["PW%d_POD_nom_full_pack_energy" % idx] = None
-                        # Additional System Status Data
-                        pod["PW%d_POD_nom_energy_remaining" % idx] = get_value(
-                            block, "nominal_energy_remaining"
-                        )  # map
-                        pod["PW%d_POD_nom_full_pack_energy" % idx] = get_value(
-                            block, "nominal_full_pack_energy"
-                        )  # map
-                        pod["PW%d_PackagePartNumber" % idx] = get_value(
-                            block, "PackagePartNumber"
-                        )
-                        pod["PW%d_PackageSerialNumber" % idx] = get_value(
-                            block, "PackageSerialNumber"
-                        )
-                        pod["PW%d_pinv_state" % idx] = get_value(block, "pinv_state")
-                        pod["PW%d_pinv_grid_state" % idx] = get_value(
-                            block, "pinv_grid_state"
-                        )
-                        pod["PW%d_p_out" % idx] = get_value(block, "p_out")
-                        pod["PW%d_q_out" % idx] = get_value(block, "q_out")
-                        pod["PW%d_v_out" % idx] = get_value(block, "v_out")
-                        pod["PW%d_f_out" % idx] = get_value(block, "f_out")
-                        pod["PW%d_i_out" % idx] = get_value(block, "i_out")
-                        pod["PW%d_energy_charged" % idx] = get_value(
-                            block, "energy_charged"
-                        )
-                        pod["PW%d_energy_discharged" % idx] = get_value(
-                            block, "energy_discharged"
-                        )
-                        pod["PW%d_off_grid" % idx] = int(get_value(block, "off_grid") or 0)
-                        pod["PW%d_vf_mode" % idx] = int(get_value(block, "vf_mode") or 0)
-                        pod["PW%d_wobble_detected" % idx] = int(
-                            get_value(block, "wobble_detected") or 0
-                        )
-                        pod["PW%d_charge_power_clamped" % idx] = int(
-                            get_value(block, "charge_power_clamped") or 0
-                        )
-                        pod["PW%d_backup_ready" % idx] = int(
-                            get_value(block, "backup_ready") or 0
-                        )
-                        pod["PW%d_OpSeqState" % idx] = get_value(block, "OpSeqState")
-                        pod["PW%d_version" % idx] = get_value(block, "version")
-                        idx = idx + 1
-                # Augment with Vitals Data if available
-                vitals = safe_pw_call(pw.vitals) or {}
-                idx = 1
-                for device in vitals:
-                    v = vitals[device]
-                    if device.startswith("TEPOD"):
-                        pod["PW%d_name" % idx] = device
-                        pod["PW%d_POD_ActiveHeating" % idx] = int(
-                            get_value(v, "POD_ActiveHeating") or 0
-                        )
-                        pod["PW%d_POD_ChargeComplete" % idx] = int(
-                            get_value(v, "POD_ChargeComplete") or 0
-                        )
-                        pod["PW%d_POD_ChargeRequest" % idx] = int(
-                            get_value(v, "POD_ChargeRequest") or 0
-                        )
-                        pod["PW%d_POD_DischargeComplete" % idx] = int(
-                            get_value(v, "POD_DischargeComplete") or 0
-                        )
-                        pod["PW%d_POD_PermanentlyFaulted" % idx] = int(
-                            get_value(v, "POD_PermanentlyFaulted") or 0
-                        )
-                        pod["PW%d_POD_PersistentlyFaulted" % idx] = int(
-                            get_value(v, "POD_PersistentlyFaulted") or 0
-                        )
-                        pod["PW%d_POD_enable_line" % idx] = int(
-                            get_value(v, "POD_enable_line") or 0
-                        )
-                        pod["PW%d_POD_available_charge_power" % idx] = get_value(
-                            v, "POD_available_charge_power"
-                        )
-                        pod["PW%d_POD_available_dischg_power" % idx] = get_value(
-                            v, "POD_available_dischg_power"
-                        )
-                        pod["PW%d_POD_nom_energy_remaining" % idx] = get_value(
-                            v, "POD_nom_energy_remaining"
-                        )
-                        pod["PW%d_POD_nom_energy_to_be_charged" % idx] = get_value(
-                            v, "POD_nom_energy_to_be_charged"
-                        )
-                        pod["PW%d_POD_nom_full_pack_energy" % idx] = get_value(
-                            v, "POD_nom_full_pack_energy"
-                        )
-                        idx = idx + 1
-                # Note: Expansion packs are now included in vitals() as TEPOD entries,
-                # so they're automatically picked up by the loop above.
-                # Aggregate data
-                pod["nominal_full_pack_energy"] = get_value(d, "nominal_full_pack_energy")
-                pod["nominal_energy_remaining"] = get_value(d, "nominal_energy_remaining")
-                pod["time_remaining_hours"] = safe_pw_call(pw.get_time_remaining)
-                pod["backup_reserve_percent"] = safe_pw_call(pw.get_reserve)
-                return json.dumps(pod)
-            
-            message = cached_route_handler("/pod", generate_pod)
+            message = handle_pod_route()
         elif request_path == "/json":
-            # JSON - Grid,Home,Solar,Battery,Level,GridStatus,Reserve,TimeRemaining,FullEnergy,RemainingEnergy,Strings
-            def generate_json():
-                # Optimization: Use single aggregates call for all power values (like CSV endpoint)
-                aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
-                if aggregates:
-                    grid = aggregates.get('site', {}).get('instant_power', 0)
-                    solar = aggregates.get('solar', {}).get('instant_power', 0)
-                    battery = aggregates.get('battery', {}).get('instant_power', 0)
-                    home = aggregates.get('load', {}).get('instant_power', 0)
-                else:
-                    grid = solar = battery = home = 0
-                
-                # Apply negative solar correction if configured
-                if not neg_solar and solar < 0:
-                    # Shift energy from solar to load
-                    home -= solar
-                    solar = 0
-                
-                # Get remaining data
-                d = safe_pw_call(pw.system_status) or {}
-                values = {
-                    "grid": grid,
-                    "home": home,
-                    "solar": solar,
-                    "battery": battery,
-                    "soe": safe_pw_call(pw.level) or 0,
-                    "grid_status": int(safe_pw_call(pw.grid_status) == "UP"),
-                    "reserve": safe_pw_call(pw.get_reserve) or 0,
-                    "time_remaining_hours": safe_pw_call(pw.get_time_remaining) or 0,
-                    "full_pack_energy": get_value(d, "nominal_full_pack_energy") or 0,
-                    "energy_remaining": get_value(d, "nominal_energy_remaining") or 0,
-                    "strings": safe_pw_call(pw.strings, jsonformat=False) or {},
-                }
-                return json.dumps(values)
-            
-            message = cached_route_handler("/json", generate_json)
+            message = handle_json_route()
         elif request_path == "/version":
-            # Firmware Version
-            version = safe_pw_call(pw.version)
-            v = {}
-            if version is None:
-                v["version"] = "SolarOnly"
-                v["vint"] = 0
-                message: str = json.dumps(v)
-            else:
-                v["version"] = version
-                v["vint"] = parse_version(version)
-                message: str = json.dumps(v)
+            message: str = handle_version_route()
         elif request_path == "/help":
             # Display friendly help screen link and stats
             with proxystats_lock:
