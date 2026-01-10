@@ -1072,6 +1072,253 @@ if control_secret:
         control_secret = None
 
 
+# ===================================================================
+# Route Handlers - Extract endpoint logic for better maintainability
+# ===================================================================
+
+def handle_aggregates_route():
+    """Handle /aggregates and /api/meters/aggregates endpoints."""
+    def generate_aggregates():
+        # Both routes deliver same payload, use shared cache key
+        aggregates = safe_endpoint_call(
+            "/aggregates", pw.poll, "/api/meters/aggregates"
+        )
+
+        # Parse aggregates if it's a JSON string
+        if isinstance(aggregates, str):
+            try:
+                aggregates = json.loads(aggregates)
+            except (json.JSONDecodeError, TypeError):
+                aggregates = None
+
+        if aggregates and not neg_solar and "solar" in aggregates:
+            solar = aggregates["solar"]
+            if solar and "instant_power" in solar and solar["instant_power"] < 0:
+                # Shift energy from solar to load
+                if "load" in aggregates and "instant_power" in aggregates["load"]:
+                    aggregates["load"]["instant_power"] -= solar["instant_power"]
+                # Finally, clamp solar to 0
+                solar["instant_power"] = 0
+
+        try:
+            if aggregates:
+                return json.dumps(aggregates)
+            else:
+                # No data available - return None to indicate stale/missing data
+                return None
+        except:
+            log.error(f"JSON encoding error in payload: {aggregates}")
+            return None
+
+    return cached_route_handler("/aggregates", generate_aggregates)
+
+
+def handle_soe_route():
+    """Handle /soe endpoint - Battery Level JSON."""
+    return safe_endpoint_call(
+        "/soe", pw.poll, "/api/system_status/soe", jsonformat=True
+    )
+
+
+def handle_api_system_status_soe_route():
+    """Handle /api/system_status/soe endpoint - Force 95% Scale."""
+    level = safe_pw_call(pw.level, scale=True)
+    return json.dumps({"percentage": level}) if level is not None else None
+
+
+def handle_api_system_status_grid_status_route():
+    """Handle /api/system_status/grid_status endpoint."""
+    return safe_pw_call(
+        pw.poll, "/api/system_status/grid_status", jsonformat=True
+    )
+
+
+def handle_csv_route(request_path):
+    """
+    Handle /csv and /csv/v2 endpoints.
+    Returns CSV formatted power data.
+    """
+    # Determine endpoint and whether to include headers
+    is_v2 = request_path.startswith("/csv/v2")
+    include_headers = "headers" in request_path
+    cache_key = f"/csv/v2{'_headers' if include_headers else ''}" if is_v2 else f"/csv{'_headers' if include_headers else ''}"
+    
+    def generate_csv():
+        # Optimization: Use single aggregates call for all power values
+        aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
+        if aggregates:
+            grid = aggregates.get('site', {}).get('instant_power', 0)
+            solar = aggregates.get('solar', {}).get('instant_power', 0)
+            battery = aggregates.get('battery', {}).get('instant_power', 0)
+            home = aggregates.get('load', {}).get('instant_power', 0)
+        else:
+            grid = solar = battery = home = 0
+        
+        # Apply negative solar correction if configured
+        if not neg_solar and solar < 0:
+            # Shift energy from solar to load
+            home -= solar
+            solar = 0
+        
+        # Get battery level - poll() handles caching internally
+        batterylevel = safe_pw_call(pw.level) or 0
+        
+        if is_v2:
+            # Get grid status and reserve - these use cached data internally
+            gridstatus = 1 if safe_pw_call(pw.grid_status) == "UP" else 0
+            reserve = safe_pw_call(pw.get_reserve) or 0
+        
+        # Build CSV response
+        if is_v2:
+            result = ""
+            if include_headers:
+                result += (
+                    "Grid,Home,Solar,Battery,BatteryLevel,GridStatus,Reserve\n"
+                )
+            result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%d,%d\n" % (
+                grid,
+                home,
+                solar,
+                battery,
+                batterylevel,
+                gridstatus,
+                reserve,
+            )
+        else:
+            result = ""
+            if include_headers:
+                result += "Grid,Home,Solar,Battery,BatteryLevel\n"
+            result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\n" % (
+                grid,
+                home,
+                solar,
+                battery,
+                batterylevel,
+            )
+        return result
+    
+    return cached_route_handler(cache_key, generate_csv)
+
+
+def handle_vitals_route():
+    """Handle /vitals endpoint - Vitals Data JSON."""
+    return cached_route_handler(
+        "/vitals",
+        lambda: safe_endpoint_call("/vitals", pw.vitals, jsonformat=True)
+    )
+
+
+def handle_strings_route():
+    """Handle /strings endpoint - Strings Data JSON."""
+    return cached_route_handler(
+        "/strings",
+        lambda: safe_endpoint_call("/strings", pw.strings, jsonformat=True)
+    )
+
+
+def handle_stats_route():
+    """Handle /stats endpoint - Internal statistics."""
+    with proxystats_lock:
+        proxystats["ts"] = int(time.time())
+        delta = proxystats["ts"] - proxystats["start"]
+        proxystats["uptime"] = str(datetime.timedelta(seconds=delta))
+        proxystats["mem"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        proxystats["site_name"] = safe_pw_call(pw.site_name)
+        proxystats["cloudmode"] = pw.cloudmode
+        proxystats["fleetapi"] = pw.fleetapi
+        if (pw.cloudmode or pw.fleetapi) and pw.client is not None:
+            proxystats["siteid"] = pw.client.siteid
+            proxystats["counter"] = pw.client.counter
+
+        # Add connection health stats if enabled
+        if health_check_enabled:
+            with _connection_health_lock:
+                proxystats["connection_health"] = {
+                    "consecutive_failures": _connection_health[
+                        "consecutive_failures"
+                    ],
+                    "total_failures": _connection_health["total_failures"],
+                    "total_successes": _connection_health["total_successes"],
+                    "is_degraded": _connection_health["is_degraded"],
+                    "last_success_time": _connection_health[
+                        "last_success_time"
+                    ],
+                    "cache_size": len(_last_good_responses)
+                    if graceful_degradation
+                    else 0,
+                }
+
+        # Add cache memory usage statistics
+        proxystats["mem_cache"] = {}
+
+        with _error_counts_lock:
+            proxystats["mem_cache"]["error_counts"] = {
+                "entries": len(_error_counts),
+                "size_bytes": sys.getsizeof(_error_counts) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) 
+                    for k, v in _error_counts.items()
+                ),
+            }
+            proxystats["mem_cache"]["network_error_summary"] = {
+                "entries": len(_network_error_summary),
+                "size_bytes": sys.getsizeof(_network_error_summary) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sum(
+                        sys.getsizeof(ek) + sys.getsizeof(ev) 
+                        for ek, ev in v.items()
+                    ) for k, v in _network_error_summary.items()
+                ),
+            }
+
+        with _last_good_responses_lock:
+            proxystats["mem_cache"]["degradation_cache"] = {
+                "entries": len(_last_good_responses),
+                "size_bytes": sys.getsizeof(_last_good_responses) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
+                    for k, v in _last_good_responses.items()
+                ),
+            }
+
+        with _performance_cache_lock:
+            proxystats["mem_cache"]["performance_cache"] = {
+                "entries": len(_performance_cache),
+                "size_bytes": sys.getsizeof(_performance_cache) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
+                    for k, v in _performance_cache.items()
+                ),
+            }
+
+        with _endpoint_stats_lock:
+            proxystats["mem_cache"]["endpoint_stats"] = {
+                "entries": len(_endpoint_stats),
+                "size_bytes": sys.getsizeof(_endpoint_stats) + sum(
+                    sys.getsizeof(k) + sys.getsizeof(v) + sum(
+                        sys.getsizeof(ek) + sys.getsizeof(ev) 
+                        for ek, ev in v.items()
+                    ) for k, v in _endpoint_stats.items()
+                ),
+            }
+
+        # Add total cache memory usage
+        total_cache_bytes = sum(
+            cache_info["size_bytes"] for cache_info in proxystats["mem_cache"].values()
+        )
+        proxystats["mem_cache"]["total_cache_bytes"] = total_cache_bytes
+        proxystats["mem_cache"]["total_cache_mb"] = round(total_cache_bytes / 1024 / 1024, 2)
+
+        return json.dumps(proxystats)
+
+
+def handle_stats_clear_route():
+    """Handle /stats/clear endpoint."""
+    log.debug("Clear internal stats")
+    with proxystats_lock:
+        proxystats["gets"] = 0
+        proxystats["errors"] = 0
+        proxystats["uri"] = {}
+        proxystats["clear"] = int(time.time())
+    return json.dumps(proxystats)
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -1252,234 +1499,24 @@ class Handler(BaseHTTPRequestHandler):
             request_path = "/" + new_path
 
         if request_path == "/aggregates" or request_path == "/api/meters/aggregates":
-            # Meters - JSON
-            def generate_aggregates():
-                # Both routes deliver same payload, use shared cache key
-                aggregates = safe_endpoint_call(
-                    "/aggregates", pw.poll, "/api/meters/aggregates"
-                )
-
-                # Parse aggregates if it's a JSON string
-                if isinstance(aggregates, str):
-                    try:
-                        aggregates = json.loads(aggregates)
-                    except (json.JSONDecodeError, TypeError):
-                        aggregates = None
-
-                if aggregates and not neg_solar and "solar" in aggregates:
-                    solar = aggregates["solar"]
-                    if solar and "instant_power" in solar and solar["instant_power"] < 0:
-                        # Shift energy from solar to load
-                        if "load" in aggregates and "instant_power" in aggregates["load"]:
-                            aggregates["load"]["instant_power"] -= solar["instant_power"]
-                        # Finally, clamp solar to 0
-                        solar["instant_power"] = 0
-
-                try:
-                    if aggregates:
-                        return json.dumps(aggregates)
-                    else:
-                        # No data available - return None to indicate stale/missing data
-                        return None
-                except:
-                    log.error(f"JSON encoding error in payload: {aggregates}")
-                    return None
-
-            message = cached_route_handler("/aggregates", generate_aggregates)
+            message = handle_aggregates_route()
         elif request_path == "/soe":
-            # Battery Level - JSON
-            message: str = safe_endpoint_call(
-                "/soe", pw.poll, "/api/system_status/soe", jsonformat=True
-            )
-            # Return None if no current data available (better than fake 0%)
+            message: str = handle_soe_route()
         elif request_path == "/api/system_status/soe":
-            # Force 95% Scale
-            level = safe_pw_call(pw.level, scale=True)
-            message: str = (
-                json.dumps({"percentage": level}) if level is not None else None
-            )
+            message: str = handle_api_system_status_soe_route()
         elif request_path == "/api/system_status/grid_status":
-            # Grid Status - JSON
-            message: str = safe_pw_call(
-                pw.poll, "/api/system_status/grid_status", jsonformat=True
-            )
+            message: str = handle_api_system_status_grid_status_route()
         elif request_path.startswith("/csv") or request_path.startswith("/csv/v2"):
-            # CSV Output - Grid,Home,Solar,Battery,Level
-            # CSV2 Output - Grid,Home,Solar,Battery,Level,GridStatus,Reserve
-            # Add ?headers to include CSV headers, e.g. http://localhost:8675/csv?headers
             contenttype = "text/plain; charset=utf-8"
-            
-            # Determine endpoint and whether to include headers
-            is_v2 = request_path.startswith("/csv/v2")
-            include_headers = "headers" in request_path
-            cache_key = f"/csv/v2{'_headers' if include_headers else ''}" if is_v2 else f"/csv{'_headers' if include_headers else ''}"
-            
-            def generate_csv():
-                # Optimization: Use single aggregates call for all power values
-                aggregates = safe_endpoint_call("/aggregates", pw.poll, "/api/meters/aggregates", jsonformat=False)
-                if aggregates:
-                    grid = aggregates.get('site', {}).get('instant_power', 0)
-                    solar = aggregates.get('solar', {}).get('instant_power', 0)
-                    battery = aggregates.get('battery', {}).get('instant_power', 0)
-                    home = aggregates.get('load', {}).get('instant_power', 0)
-                else:
-                    grid = solar = battery = home = 0
-                
-                # Apply negative solar correction if configured
-                if not neg_solar and solar < 0:
-                    # Shift energy from solar to load
-                    home -= solar
-                    solar = 0
-                
-                # Get battery level - poll() handles caching internally
-                batterylevel = safe_pw_call(pw.level) or 0
-                
-                if is_v2:
-                    # Get grid status and reserve - these use cached data internally
-                    gridstatus = 1 if safe_pw_call(pw.grid_status) == "UP" else 0
-                    reserve = safe_pw_call(pw.get_reserve) or 0
-                
-                # Build CSV response
-                if is_v2:
-                    result = ""
-                    if include_headers:
-                        result += (
-                            "Grid,Home,Solar,Battery,BatteryLevel,GridStatus,Reserve\n"
-                        )
-                    result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f,%d,%d\n" % (
-                        grid,
-                        home,
-                        solar,
-                        battery,
-                        batterylevel,
-                        gridstatus,
-                        reserve,
-                    )
-                else:
-                    result = ""
-                    if include_headers:
-                        result += "Grid,Home,Solar,Battery,BatteryLevel\n"
-                    result += "%0.2f,%0.2f,%0.2f,%0.2f,%0.2f\n" % (
-                        grid,
-                        home,
-                        solar,
-                        battery,
-                        batterylevel,
-                    )
-                return result
-            
-            message = cached_route_handler(cache_key, generate_csv)
+            message = handle_csv_route(request_path)
         elif request_path == "/vitals":
-            # Vitals Data - JSON
-            message = cached_route_handler(
-                "/vitals",
-                lambda: safe_endpoint_call("/vitals", pw.vitals, jsonformat=True)
-            )
+            message = handle_vitals_route()
         elif request_path == "/strings":
-            # Strings Data - JSON
-            message = cached_route_handler(
-                "/strings",
-                lambda: safe_endpoint_call("/strings", pw.strings, jsonformat=True)
-            )
+            message = handle_strings_route()
         elif request_path == "/stats":
-            # Give Internal Stats
-            with proxystats_lock:
-                proxystats["ts"] = int(time.time())
-                delta = proxystats["ts"] - proxystats["start"]
-                proxystats["uptime"] = str(datetime.timedelta(seconds=delta))
-                proxystats["mem"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                proxystats["site_name"] = safe_pw_call(pw.site_name)
-                proxystats["cloudmode"] = pw.cloudmode
-                proxystats["fleetapi"] = pw.fleetapi
-                if (pw.cloudmode or pw.fleetapi) and pw.client is not None:
-                    proxystats["siteid"] = pw.client.siteid
-                    proxystats["counter"] = pw.client.counter
-
-                # Add connection health stats if enabled
-                if health_check_enabled:
-                    with _connection_health_lock:
-                        proxystats["connection_health"] = {
-                            "consecutive_failures": _connection_health[
-                                "consecutive_failures"
-                            ],
-                            "total_failures": _connection_health["total_failures"],
-                            "total_successes": _connection_health["total_successes"],
-                            "is_degraded": _connection_health["is_degraded"],
-                            "last_success_time": _connection_health[
-                                "last_success_time"
-                            ],
-                            "cache_size": len(_last_good_responses)
-                            if graceful_degradation
-                            else 0,
-                        }
-
-                # Add cache memory usage statistics
-                proxystats["mem_cache"] = {}
-
-                with _error_counts_lock:
-                    proxystats["mem_cache"]["error_counts"] = {
-                        "entries": len(_error_counts),
-                        "size_bytes": sys.getsizeof(_error_counts) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) 
-                            for k, v in _error_counts.items()
-                        ),
-                    }
-                    proxystats["mem_cache"]["network_error_summary"] = {
-                        "entries": len(_network_error_summary),
-                        "size_bytes": sys.getsizeof(_network_error_summary) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sum(
-                                sys.getsizeof(ek) + sys.getsizeof(ev) 
-                                for ek, ev in v.items()
-                            ) for k, v in _network_error_summary.items()
-                        ),
-                    }
-
-                with _last_good_responses_lock:
-                    proxystats["mem_cache"]["degradation_cache"] = {
-                        "entries": len(_last_good_responses),
-                        "size_bytes": sys.getsizeof(_last_good_responses) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
-                            for k, v in _last_good_responses.items()
-                        ),
-                    }
-
-                with _performance_cache_lock:
-                    proxystats["mem_cache"]["performance_cache"] = {
-                        "entries": len(_performance_cache),
-                        "size_bytes": sys.getsizeof(_performance_cache) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sys.getsizeof(v[0]) + sys.getsizeof(v[1])
-                            for k, v in _performance_cache.items()
-                        ),
-                    }
-
-                with _endpoint_stats_lock:
-                    proxystats["mem_cache"]["endpoint_stats"] = {
-                        "entries": len(_endpoint_stats),
-                        "size_bytes": sys.getsizeof(_endpoint_stats) + sum(
-                            sys.getsizeof(k) + sys.getsizeof(v) + sum(
-                                sys.getsizeof(ek) + sys.getsizeof(ev) 
-                                for ek, ev in v.items()
-                            ) for k, v in _endpoint_stats.items()
-                        ),
-                    }
-
-                # Add total cache memory usage
-                total_cache_bytes = sum(
-                    cache_info["size_bytes"] for cache_info in proxystats["mem_cache"].values()
-                )
-                proxystats["mem_cache"]["total_cache_bytes"] = total_cache_bytes
-                proxystats["mem_cache"]["total_cache_mb"] = round(total_cache_bytes / 1024 / 1024, 2)
-
-                message: str = json.dumps(proxystats)
+            message: str = handle_stats_route()
         elif request_path == "/stats/clear":
-            # Clear Internal Stats
-            log.debug("Clear internal stats")
-            with proxystats_lock:
-                proxystats["gets"] = 0
-                proxystats["errors"] = 0
-                proxystats["uri"] = {}
-                proxystats["clear"] = int(time.time())
-            message: str = json.dumps(proxystats)
+            message: str = handle_stats_clear_route()
         elif request_path == "/health":
             # Connection Health and Cache Status
             health_info = {
