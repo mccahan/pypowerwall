@@ -1075,6 +1075,22 @@ if control_secret:
 # ===================================================================
 # Route Handlers - Extract endpoint logic for better maintainability
 # ===================================================================
+# 
+# These route handler functions extract complex endpoint logic from the
+# monolithic do_GET method into focused, testable functions. Each handler
+# is responsible for a specific endpoint or group of related endpoints.
+#
+# Benefits:
+# - Improved code organization and readability
+# - Easier testing and debugging
+# - Better separation of concerns
+# - Simplified do_GET method
+#
+# Route handlers use the following helpers:
+# - safe_pw_call() - Safely call pypowerwall functions with error handling
+# - safe_endpoint_call() - Call endpoints with caching and graceful degradation
+# - cached_route_handler() - Add performance caching to route responses
+# ===================================================================
 
 def handle_aggregates_route():
     """Handle /aggregates and /api/meters/aggregates endpoints."""
