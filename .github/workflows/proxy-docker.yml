@@ -24,7 +24,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Copy local pypowerwall
         run: |
-          cp pypowerwall/ proxy/
+          cp -r pypowerwall/ proxy/
           echo 'RUN pip show pypowerwall'
           echo 'COPY ./pypowerwall /usr/local/lib/python3.10/site-packages/' >> proxy/Dockerfile
       - name: Build and push
