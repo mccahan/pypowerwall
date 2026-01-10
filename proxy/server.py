@@ -979,7 +979,7 @@ def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs)
     """
     Safely call a pypowerwall function for an endpoint with caching and graceful degradation.
     
-    For /api/meters/aggregates and /api/system_status/soe endpoints:
+    For /api/meters/aggregates, /api/system_status/soe, and /api/system_status endpoints:
     - Returns cached data immediately if available and fresh (within cache_expire seconds)
     - Triggers asynchronous background update to refresh cache
     - Throttles updates to not occur more frequently than cache expiration time
@@ -988,7 +988,7 @@ def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs)
     - Attempts fresh data first, falls back to cache on failure
 
     Args:
-        endpoint_name: Name of the endpoint for caching (e.g., '/aggregates', '/soe')
+        endpoint_name: Name of the endpoint for caching (e.g., '/aggregates', '/soe', '/system_status')
         pw_func: The pypowerwall function to call
         *args: Arguments to pass to the function
         jsonformat: Whether to return JSON formatted response (default True)
@@ -997,9 +997,9 @@ def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs)
     Returns:
         Response data on success, cached data if available and fresh enough, None if no data available
     """
-    # Special handling for /aggregates and /soe endpoints
+    # Special handling for /aggregates, /soe, and /system_status endpoints
     # Return cache immediately if available, trigger async update
-    if endpoint_name in ["/aggregates", "/soe"]:
+    if endpoint_name in ["/aggregates", "/soe", "/system_status"]:
         current_time = time.time()
         
         # Check if we have cached data
@@ -1427,6 +1427,11 @@ class Handler(BaseHTTPRequestHandler):
             # Grid Status - JSON
             message: str = safe_pw_call(
                 pw.poll, "/api/system_status/grid_status", jsonformat=True
+            )
+        elif request_path == "/api/system_status":
+            # System Status - JSON with async caching
+            message: str = safe_endpoint_call(
+                "/system_status", pw.poll, "/api/system_status", jsonformat=True
             )
         elif request_path.startswith("/csv") or request_path.startswith("/csv/v2"):
             # CSV Output - Grid,Home,Solar,Battery,Level

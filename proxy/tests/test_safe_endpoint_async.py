@@ -1,5 +1,5 @@
 """
-Tests for async caching behavior in safe_endpoint_call for /api/meters/aggregates and /api/system_status/soe
+Tests for async caching behavior in safe_endpoint_call for /api/meters/aggregates, /api/system_status/soe, and /api/system_status
 """
 import json
 import time
@@ -76,6 +76,33 @@ class TestSafeEndpointCallAsync(unittest.TestCase):
         
         # Call safe_endpoint_call
         result = safe_endpoint_call("/soe", mock_pw_func, "/api/system_status/soe")
+        
+        # Verify cached data was returned
+        self.assertEqual(result, test_data)
+        
+        # Verify pw_func was NOT called (returned cache immediately)
+        mock_safe_pw_call.assert_not_called()
+
+    @patch('proxy.server.safe_pw_call')
+    @patch('proxy.server.mqtt_enabled', False)
+    @patch('proxy.server.debugmode', False)
+    def test_system_status_async_cache_return(self, mock_safe_pw_call):
+        """Test /system_status endpoint returns cached data immediately"""
+        # Setup: Pre-populate cache
+        import proxy.server as server
+        test_data = json.dumps({"battery_blocks": [{"nominal_energy_remaining": 12500}]})
+        with server._last_good_responses_lock:
+            server._last_good_responses["/system_status"] = (test_data, time.time())
+        
+        # Mark as recently updated to prevent immediate async update
+        with server._endpoint_last_update_lock:
+            server._endpoint_last_update["/system_status"] = time.time()
+        
+        # Mock function
+        mock_pw_func = Mock()
+        
+        # Call safe_endpoint_call
+        result = safe_endpoint_call("/system_status", mock_pw_func, "/api/system_status")
         
         # Verify cached data was returned
         self.assertEqual(result, test_data)
