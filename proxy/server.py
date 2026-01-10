@@ -98,14 +98,6 @@ from urllib.parse import urlparse, parse_qs
 import requests
 import urllib3
 
-# MQTT client support - import with error handling
-try:
-    import paho.mqtt.client as mqtt
-    MQTT_AVAILABLE = True
-except ImportError:
-    MQTT_AVAILABLE = False
-    mqtt = None
-
 # Robust import of transform helpers to support multiple invocation patterns:
 # 1. python -m proxy.server (package-relative import works)
 # 2. python proxy/server.py from project root (absolute package import works)
@@ -219,15 +211,6 @@ degradation_cache_ttl_seconds = int(
     os.getenv("PW_CACHE_TTL", "30")
 )  # Maximum age for cached data before returning None
 
-# MQTT Configuration
-mqtt_enabled = os.getenv("MQTT_HOST", "") != ""
-mqtt_host = os.getenv("MQTT_HOST", "")
-mqtt_port = int(os.getenv("MQTT_PORT", "1883"))
-mqtt_user = os.getenv("MQTT_USER", "")
-mqtt_password = os.getenv("MQTT_PASSWORD", "")
-mqtt_topic_prefix = os.getenv("MQTT_TOPIC_PREFIX", "pypowerwall")
-mqtt_client_id = os.getenv("MQTT_CLIENT_ID", "pypowerwall-proxy")
-
 # Global Stats
 proxystats = {
     "pypowerwall": "%s Proxy %s" % (pypowerwall.version, BUILD),
@@ -251,10 +234,6 @@ proxystats = {
     "siteid": None,
     "counter": 0,
     "cf": cachefile,
-    "mqtt_enabled": mqtt_enabled,
-    "mqtt_connected": False,
-    "mqtt_publish_count": 0,
-    "mqtt_error_count": 0,
     "config": {
         "PW_BIND_ADDRESS": bind_address,
         "PW_PASSWORD": "*" * len(password) if password else None,
@@ -282,12 +261,6 @@ proxystats = {
         "PW_GRACEFUL_DEGRADATION": graceful_degradation,
         "PW_HEALTH_CHECK": health_check_enabled,
         "PW_CACHE_TTL": degradation_cache_ttl_seconds,
-        "PW_MQTT_HOST": mqtt_host if mqtt_host else None,
-        "PW_MQTT_PORT": mqtt_port if mqtt_enabled else None,
-        "PW_MQTT_USER": mqtt_user if mqtt_user else None,
-        "PW_MQTT_PASSWORD": "*" * len(mqtt_password) if mqtt_password else None,
-        "PW_MQTT_TOPIC_PREFIX": mqtt_topic_prefix if mqtt_enabled else None,
-        "PW_MQTT_CLIENT_ID": mqtt_client_id if mqtt_enabled else None,
     },
 }
 proxystats_lock = threading.RLock()
@@ -343,101 +316,6 @@ if graceful_degradation:
     )
 if health_check_enabled:
     log.info("Connection health monitoring enabled (PW_HEALTH_CHECK=yes)")
-
-# MQTT Client Setup
-mqtt_client = None
-mqtt_client_lock = threading.RLock()
-
-def init_mqtt_client():
-    """Initialize MQTT client with connection and error handling."""
-    global mqtt_client, proxystats
-    
-    if not mqtt_enabled or not MQTT_AVAILABLE:
-        if mqtt_enabled and not MQTT_AVAILABLE:
-            log.warning("MQTT enabled but paho-mqtt library not available - install with: pip install paho-mqtt")
-        return None
-    
-    try:
-        # Create MQTT client with stable identifier
-        # Allow override via environment variable for multi-instance deployments
-        client = mqtt.Client(client_id=mqtt_client_id)
-        
-        # Set username and password if provided
-        if mqtt_user and mqtt_password:
-            client.username_pw_set(mqtt_user, mqtt_password)
-        
-        # Set callbacks
-        def on_connect(client, userdata, flags, rc):
-            if rc == 0:
-                log.info(f"MQTT connected to {mqtt_host}:{mqtt_port}")
-                with proxystats_lock:
-                    proxystats["mqtt_connected"] = True
-            else:
-                log.warning(f"MQTT connection failed with code {rc}")
-                with proxystats_lock:
-                    proxystats["mqtt_connected"] = False
-        
-        def on_disconnect(client, userdata, rc):
-            log.info("MQTT disconnected")
-            with proxystats_lock:
-                proxystats["mqtt_connected"] = False
-        
-        client.on_connect = on_connect
-        client.on_disconnect = on_disconnect
-        
-        # Connect to broker (non-blocking)
-        try:
-            client.connect_async(mqtt_host, mqtt_port, keepalive=60)
-            client.loop_start()  # Start network loop in background thread
-            log.info(f"MQTT client initialized - connecting to {mqtt_host}:{mqtt_port}")
-        except Exception as e:
-            log.warning(f"MQTT connection initiation failed: {e}")
-            return None
-        
-        return client
-    
-    except Exception as e:
-        log.warning(f"Failed to initialize MQTT client: {e}")
-        return None
-
-def publish_mqtt(topic, value):
-    """
-    Publish a value to an MQTT topic. Does not raise exceptions.
-    
-    Args:
-        topic: MQTT topic string (will be prefixed with mqtt_topic_prefix)
-        value: Value to publish (will be converted to string)
-    """
-    global mqtt_client, proxystats
-    
-    if not mqtt_enabled or mqtt_client is None or not MQTT_AVAILABLE:
-        return
-    
-    try:
-        full_topic = f"{mqtt_topic_prefix}/{topic}"
-        result = mqtt_client.publish(full_topic, str(value), qos=0, retain=False)
-        
-        # Check if publish was successful (queued)
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            with proxystats_lock:
-                proxystats["mqtt_publish_count"] += 1
-            if debugmode:
-                log.debug(f"MQTT published: {full_topic} = {value}")
-        else:
-            with proxystats_lock:
-                proxystats["mqtt_error_count"] += 1
-            if debugmode:
-                log.debug(f"MQTT publish failed: {full_topic}, rc={result.rc}")
-    
-    except Exception as e:
-        with proxystats_lock:
-            proxystats["mqtt_error_count"] += 1
-        if debugmode:
-            log.debug(f"MQTT publish exception for {topic}: {e}")
-
-# Initialize MQTT client if enabled
-if mqtt_enabled:
-    mqtt_client = init_mqtt_client()
 
 # Rate limiter for network error logging to prevent spam
 _error_counts = {}
@@ -845,77 +723,6 @@ def safe_pw_call(pw_func, *args, **kwargs):
         return None
 
 
-def publish_meter_aggregates_to_mqtt(aggregates_data):
-    """
-    Publish meter aggregate instant_power values and battery level to MQTT.
-    
-    Extracts and publishes instant_power from the following meter types:
-    - site: Grid power (watts)
-    - solar: Solar generation power (watts)
-    - battery: Battery charge/discharge power (watts, negative = charging)
-    - load: Home consumption power (watts)
-    
-    Also publishes battery level (percentage) to battery/level.
-    
-    Args:
-        aggregates_data: Dictionary or JSON string containing meter aggregates.
-                        Expected structure: {'site': {'instant_power': float}, 
-                                           'solar': {'instant_power': float},
-                                           'battery': {'instant_power': float},
-                                           'load': {'instant_power': float}}
-    """
-    if not mqtt_enabled or mqtt_client is None:
-        return
-    
-    try:
-        # Parse JSON string if needed
-        if isinstance(aggregates_data, str):
-            try:
-                aggregates = json.loads(aggregates_data)
-            except (json.JSONDecodeError, TypeError):
-                return
-        else:
-            aggregates = aggregates_data
-        
-        if not isinstance(aggregates, dict):
-            return
-        
-        # Publish instant_power for each meter type in logical order
-        # site (grid)
-        if 'site' in aggregates and isinstance(aggregates['site'], dict):
-            site_power = aggregates['site'].get('instant_power')
-            if site_power is not None:
-                publish_mqtt("site/instant_power", site_power)
-        
-        # solar
-        if 'solar' in aggregates and isinstance(aggregates['solar'], dict):
-            solar_power = aggregates['solar'].get('instant_power')
-            if solar_power is not None:
-                publish_mqtt("solar/instant_power", solar_power)
-        
-        # battery
-        if 'battery' in aggregates and isinstance(aggregates['battery'], dict):
-            battery_power = aggregates['battery'].get('instant_power')
-            if battery_power is not None:
-                publish_mqtt("battery/instant_power", battery_power)
-        
-        # load (home)
-        if 'load' in aggregates and isinstance(aggregates['load'], dict):
-            load_power = aggregates['load'].get('instant_power')
-            if load_power is not None:
-                publish_mqtt("load/instant_power", load_power)
-        
-        # Get and publish battery level (percentage)
-        battery_level = safe_pw_call(pw.level)
-        if battery_level is not None:
-            publish_mqtt("battery/level", battery_level)
-    
-    except Exception as e:
-        # Silently handle errors - MQTT should not break the proxy
-        if debugmode:
-            log.debug(f"Error publishing aggregates to MQTT: {e}")
-
-
 def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs):
     """
     Safely call a pypowerwall function for an endpoint with caching and graceful degradation.
@@ -940,11 +747,6 @@ def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs)
     if result is not None:
         cache_response(endpoint_name, result)
         track_endpoint_call(endpoint_name, success=True)
-        
-        # Publish to MQTT if this is the aggregates endpoint
-        if endpoint_name == "/aggregates" and mqtt_enabled:
-            publish_meter_aggregates_to_mqtt(result)
-        
         return result
 
     # Failed to get fresh data - track failure
@@ -1563,18 +1365,6 @@ class Handler(BaseHTTPRequestHandler):
 
                 if endpoint_stats:
                     health_info["endpoint_statistics"] = endpoint_stats
-
-            # Add MQTT status if enabled
-            if mqtt_enabled:
-                with proxystats_lock:
-                    health_info["mqtt_status"] = {
-                        "enabled": mqtt_enabled,
-                        "connected": proxystats["mqtt_connected"],
-                        "publish_count": proxystats["mqtt_publish_count"],
-                        "error_count": proxystats["mqtt_error_count"],
-                        "broker": f"{mqtt_host}:{mqtt_port}",
-                        "topic_prefix": mqtt_topic_prefix,
-                    }
 
             message: str = json.dumps(health_info)
         elif request_path == "/health/reset":
