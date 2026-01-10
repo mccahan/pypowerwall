@@ -236,15 +236,26 @@ class TestMQTTAggregatesPublishing(unittest.TestCase):
 class TestMQTTIntegrationWithSafeEndpointCall(unittest.TestCase):
     """Test MQTT integration with safe_endpoint_call"""
 
+    def setUp(self):
+        """Clear caches before each test"""
+        import time
+        # Clear all endpoint-related caches
+        with server._last_good_responses_lock:
+            server._last_good_responses.clear()
+        with server._endpoint_last_update_lock:
+            server._endpoint_last_update.clear()
+        with server._endpoint_update_in_progress_lock:
+            server._endpoint_update_in_progress.clear()
+
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'publish_meter_aggregates_to_mqtt')
     @patch.object(server, 'safe_pw_call')
-    @patch.object(server, 'cache_response')
     @patch.object(server, 'track_endpoint_call')
     def test_safe_endpoint_call_publishes_aggregates(
-        self, mock_track, mock_cache, mock_pw_call, mock_publish
+        self, mock_track, mock_pw_call, mock_publish
     ):
         """Test that safe_endpoint_call publishes to MQTT for aggregates endpoint"""
+        import time
         aggregates_data = {"site": {"instant_power": 1500}}
         mock_pw_call.return_value = aggregates_data
         
@@ -257,6 +268,9 @@ class TestMQTTIntegrationWithSafeEndpointCall(unittest.TestCase):
             "/aggregates", mock_pw.poll, "/api/meters/aggregates", jsonformat=False
         )
         
+        # Wait briefly for async update to complete
+        time.sleep(0.5)
+        
         # Verify MQTT publishing was triggered
         mock_publish.assert_called_once_with(aggregates_data)
         
@@ -266,10 +280,9 @@ class TestMQTTIntegrationWithSafeEndpointCall(unittest.TestCase):
     @patch.object(server, 'mqtt_enabled', True)
     @patch.object(server, 'publish_meter_aggregates_to_mqtt')
     @patch.object(server, 'safe_pw_call')
-    @patch.object(server, 'cache_response')
     @patch.object(server, 'track_endpoint_call')
     def test_safe_endpoint_call_does_not_publish_other_endpoints(
-        self, mock_track, mock_cache, mock_pw_call, mock_publish
+        self, mock_track, mock_pw_call, mock_publish
     ):
         """Test that safe_endpoint_call does not publish for non-aggregates endpoints"""
         vitals_data = {"device1": {"PINV_Fout": 60.0}}
