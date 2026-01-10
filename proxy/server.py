@@ -1319,6 +1319,196 @@ def handle_stats_clear_route():
     return json.dumps(proxystats)
 
 
+def handle_health_route():
+    """Handle /health endpoint - Connection Health and Cache Status."""
+    health_info = {
+        "pypowerwall": "%s Proxy %s" % (pypowerwall.version, BUILD),
+        "pypowerwall_cache_expire": cache_expire,
+        "degradation_cache_ttl_seconds": degradation_cache_ttl_seconds,
+        "graceful_degradation": graceful_degradation,
+        "fail_fast_mode": fail_fast_mode,
+        "health_check_enabled": health_check_enabled,
+        "startup_time": datetime.datetime.fromtimestamp(
+            proxystats["start"]
+        ).isoformat(),
+        "current_time": datetime.datetime.now().isoformat(),
+    }
+
+    # Add overall proxy response counters
+    with proxystats_lock:
+        health_info["proxy_stats"] = {
+            "total_gets": proxystats["gets"],
+            "total_posts": proxystats["posts"],
+            "total_errors": proxystats["errors"],
+            "total_timeouts": proxystats["timeout"],
+        }
+
+    if health_check_enabled:
+        with _connection_health_lock:
+            health_info["connection_health"] = {
+                "consecutive_failures": _connection_health[
+                    "consecutive_failures"
+                ],
+                "total_failures": _connection_health["total_failures"],
+                "total_successes": _connection_health["total_successes"],
+                "is_degraded": _connection_health["is_degraded"],
+                "last_success_time": _connection_health["last_success_time"],
+                "last_success_age_seconds": time.time()
+                - _connection_health["last_success_time"],
+            }
+
+    if graceful_degradation:
+        with _last_good_responses_lock:
+            cached_endpoints = {}
+            current_time = time.time()
+            for endpoint, (data, timestamp) in _last_good_responses.items():
+                age = current_time - timestamp
+                cached_endpoints[endpoint] = {
+                    "age_seconds": age,
+                    "is_expired": age >= degradation_cache_ttl_seconds,
+                }
+            health_info["cached_data"] = {
+                "cache_size": len(_last_good_responses),
+                "endpoints": cached_endpoints,
+            }
+
+    # Add endpoint call statistics
+    with _endpoint_stats_lock:
+        endpoint_stats = {}
+        current_time = time.time()
+        for endpoint, stats in _endpoint_stats.items():
+            success_rate = (
+                (stats["successful_calls"] / stats["total_calls"] * 100)
+                if stats["total_calls"] > 0
+                else 0
+            )
+            endpoint_info = {
+                "total_calls": stats["total_calls"],
+                "successful_calls": stats["successful_calls"],
+                "failed_calls": stats["failed_calls"],
+                "success_rate_percent": round(success_rate, 2),
+            }
+
+            if stats["last_success_time"]:
+                endpoint_info["last_success_age_seconds"] = (
+                    current_time - stats["last_success_time"]
+                )
+            if stats["last_failure_time"]:
+                endpoint_info["last_failure_age_seconds"] = (
+                    current_time - stats["last_failure_time"]
+                )
+
+            endpoint_stats[endpoint] = endpoint_info
+
+        if endpoint_stats:
+            health_info["endpoint_statistics"] = endpoint_stats
+
+    # Add MQTT status if enabled
+    if mqtt_enabled:
+        with proxystats_lock:
+            health_info["mqtt_status"] = {
+                "enabled": mqtt_enabled,
+                "connected": proxystats["mqtt_connected"],
+                "publish_count": proxystats["mqtt_publish_count"],
+                "error_count": proxystats["mqtt_error_count"],
+                "broker": f"{mqtt_host}:{mqtt_port}",
+                "topic_prefix": mqtt_topic_prefix,
+            }
+
+    return json.dumps(health_info)
+
+
+def handle_health_reset_route():
+    """Handle /health/reset endpoint."""
+    cache_size_before = 0
+
+    if health_check_enabled:
+        with _connection_health_lock:
+            _connection_health["consecutive_failures"] = 0
+            _connection_health["total_failures"] = 0
+            _connection_health["total_successes"] = 0
+            _connection_health["is_degraded"] = False
+            _connection_health["last_success_time"] = time.time()
+
+    if graceful_degradation:
+        with _last_good_responses_lock:
+            cache_size_before = len(_last_good_responses)
+            _last_good_responses.clear()
+
+    # Reset endpoint statistics
+    endpoint_stats_count = 0
+    with _endpoint_stats_lock:
+        endpoint_stats_count = len(_endpoint_stats)
+        _endpoint_stats.clear()
+
+    log.info(
+        "Health counters, cache, and endpoint statistics reset via /health/reset endpoint"
+    )
+    return json.dumps(
+        {
+            "status": "reset_complete",
+            "health_counters_reset": health_check_enabled,
+            "cache_cleared": graceful_degradation,
+            "cache_entries_removed": cache_size_before
+            if graceful_degradation
+            else 0,
+            "endpoint_stats_cleared": endpoint_stats_count,
+        }
+    )
+
+
+def handle_temps_route():
+    """Handle /temps endpoint."""
+    return safe_pw_call(pw.temps, jsonformat=True) or json.dumps({})
+
+
+def handle_temps_pw_route():
+    """Handle /temps/pw endpoint - Temps with Simple Keys."""
+    def generate_temps_pw():
+        pwtemp = {}
+        idx = 1
+        temps = safe_pw_call(pw.temps)
+        if temps:
+            for i in temps:
+                key = "PW%d_temp" % idx
+                pwtemp[key] = temps[i]
+                idx = idx + 1
+        return json.dumps(pwtemp)
+    
+    return cached_route_handler("/temps/pw", generate_temps_pw)
+
+
+def handle_alerts_route():
+    """Handle /alerts endpoint."""
+    return safe_pw_call(pw.alerts, jsonformat=True) or json.dumps([])
+
+
+def handle_alerts_pw_route():
+    """Handle /alerts/pw endpoint - Alerts in dictionary/object format."""
+    def generate_alerts_pw():
+        pwalerts = {}
+        alerts = safe_pw_call(pw.alerts)
+        if alerts is None:
+            return None
+        else:
+            for alert in alerts:
+                pwalerts[alert] = 1
+            return json.dumps(pwalerts) or json.dumps({})
+    
+    return cached_route_handler("/alerts/pw", generate_alerts_pw)
+
+
+def handle_stats_clear_route():
+    """Handle /stats/clear endpoint."""
+    log.debug("Clear internal stats")
+    with proxystats_lock:
+        proxystats["gets"] = 0
+        proxystats["errors"] = 0
+        proxystats["uri"] = {}
+        proxystats["clear"] = int(time.time())
+    return json.dumps(proxystats)
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -1518,172 +1708,17 @@ class Handler(BaseHTTPRequestHandler):
         elif request_path == "/stats/clear":
             message: str = handle_stats_clear_route()
         elif request_path == "/health":
-            # Connection Health and Cache Status
-            health_info = {
-                "pypowerwall": "%s Proxy %s" % (pypowerwall.version, BUILD),
-                "pypowerwall_cache_expire": cache_expire,
-                "degradation_cache_ttl_seconds": degradation_cache_ttl_seconds,
-                "graceful_degradation": graceful_degradation,
-                "fail_fast_mode": fail_fast_mode,
-                "health_check_enabled": health_check_enabled,
-                "startup_time": datetime.datetime.fromtimestamp(
-                    proxystats["start"]
-                ).isoformat(),
-                "current_time": datetime.datetime.now().isoformat(),
-            }
-
-            # Add overall proxy response counters
-            with proxystats_lock:
-                health_info["proxy_stats"] = {
-                    "total_gets": proxystats["gets"],
-                    "total_posts": proxystats["posts"],
-                    "total_errors": proxystats["errors"],
-                    "total_timeouts": proxystats["timeout"],
-                }
-
-            if health_check_enabled:
-                with _connection_health_lock:
-                    health_info["connection_health"] = {
-                        "consecutive_failures": _connection_health[
-                            "consecutive_failures"
-                        ],
-                        "total_failures": _connection_health["total_failures"],
-                        "total_successes": _connection_health["total_successes"],
-                        "is_degraded": _connection_health["is_degraded"],
-                        "last_success_time": _connection_health["last_success_time"],
-                        "last_success_age_seconds": time.time()
-                        - _connection_health["last_success_time"],
-                    }
-
-            if graceful_degradation:
-                with _last_good_responses_lock:
-                    cached_endpoints = {}
-                    current_time = time.time()
-                    for endpoint, (data, timestamp) in _last_good_responses.items():
-                        age = current_time - timestamp
-                        cached_endpoints[endpoint] = {
-                            "age_seconds": age,
-                            "is_expired": age >= degradation_cache_ttl_seconds,
-                        }
-                    health_info["cached_data"] = {
-                        "cache_size": len(_last_good_responses),
-                        "endpoints": cached_endpoints,
-                    }
-
-            # Add endpoint call statistics
-            with _endpoint_stats_lock:
-                endpoint_stats = {}
-                current_time = time.time()
-                for endpoint, stats in _endpoint_stats.items():
-                    success_rate = (
-                        (stats["successful_calls"] / stats["total_calls"] * 100)
-                        if stats["total_calls"] > 0
-                        else 0
-                    )
-                    endpoint_info = {
-                        "total_calls": stats["total_calls"],
-                        "successful_calls": stats["successful_calls"],
-                        "failed_calls": stats["failed_calls"],
-                        "success_rate_percent": round(success_rate, 2),
-                    }
-
-                    if stats["last_success_time"]:
-                        endpoint_info["last_success_age_seconds"] = (
-                            current_time - stats["last_success_time"]
-                        )
-                    if stats["last_failure_time"]:
-                        endpoint_info["last_failure_age_seconds"] = (
-                            current_time - stats["last_failure_time"]
-                        )
-
-                    endpoint_stats[endpoint] = endpoint_info
-
-                if endpoint_stats:
-                    health_info["endpoint_statistics"] = endpoint_stats
-
-            # Add MQTT status if enabled
-            if mqtt_enabled:
-                with proxystats_lock:
-                    health_info["mqtt_status"] = {
-                        "enabled": mqtt_enabled,
-                        "connected": proxystats["mqtt_connected"],
-                        "publish_count": proxystats["mqtt_publish_count"],
-                        "error_count": proxystats["mqtt_error_count"],
-                        "broker": f"{mqtt_host}:{mqtt_port}",
-                        "topic_prefix": mqtt_topic_prefix,
-                    }
-
-            message: str = json.dumps(health_info)
+            message: str = handle_health_route()
         elif request_path == "/health/reset":
-            # Reset Health Counters and Clear Cache
-            cache_size_before = 0
-
-            if health_check_enabled:
-                with _connection_health_lock:
-                    _connection_health["consecutive_failures"] = 0
-                    _connection_health["total_failures"] = 0
-                    _connection_health["total_successes"] = 0
-                    _connection_health["is_degraded"] = False
-                    _connection_health["last_success_time"] = time.time()
-
-            if graceful_degradation:
-                with _last_good_responses_lock:
-                    cache_size_before = len(_last_good_responses)
-                    _last_good_responses.clear()
-
-            # Reset endpoint statistics
-            endpoint_stats_count = 0
-            with _endpoint_stats_lock:
-                endpoint_stats_count = len(_endpoint_stats)
-                _endpoint_stats.clear()
-
-            log.info(
-                "Health counters, cache, and endpoint statistics reset via /health/reset endpoint"
-            )
-            message: str = json.dumps(
-                {
-                    "status": "reset_complete",
-                    "health_counters_reset": health_check_enabled,
-                    "cache_cleared": graceful_degradation,
-                    "cache_entries_removed": cache_size_before
-                    if graceful_degradation
-                    else 0,
-                    "endpoint_stats_cleared": endpoint_stats_count,
-                }
-            )
+            message: str = handle_health_reset_route()
         elif request_path == "/temps":
-            # Temps of Powerwalls
-            message: str = safe_pw_call(pw.temps, jsonformat=True) or json.dumps({})
+            message: str = handle_temps_route()
         elif request_path == "/temps/pw":
-            # Temps of Powerwalls with Simple Keys
-            def generate_temps_pw():
-                pwtemp = {}
-                idx = 1
-                temps = safe_pw_call(pw.temps)
-                if temps:
-                    for i in temps:
-                        key = "PW%d_temp" % idx
-                        pwtemp[key] = temps[i]
-                        idx = idx + 1
-                return json.dumps(pwtemp)
-            
-            message = cached_route_handler("/temps/pw", generate_temps_pw)
+            message = handle_temps_pw_route()
         elif request_path == "/alerts":
-            # Alerts
-            message: str = safe_pw_call(pw.alerts, jsonformat=True) or json.dumps([])
+            message: str = handle_alerts_route()
         elif request_path == "/alerts/pw":
-            # Alerts in dictionary/object format
-            def generate_alerts_pw():
-                pwalerts = {}
-                alerts = safe_pw_call(pw.alerts)
-                if alerts is None:
-                    return None
-                else:
-                    for alert in alerts:
-                        pwalerts[alert] = 1
-                    return json.dumps(pwalerts) or json.dumps({})
-            
-            message = cached_route_handler("/alerts/pw", generate_alerts_pw)
+            message = handle_alerts_pw_route()
         elif request_path == "/freq":
             # Frequency, Current, Voltage and Grid Status
             def generate_freq():
