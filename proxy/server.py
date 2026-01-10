@@ -521,6 +521,12 @@ _performance_cache_lock = threading.RLock()
 _endpoint_stats = {}
 _endpoint_stats_lock = threading.RLock()
 
+# Async update tracking for throttling endpoint updates
+_endpoint_last_update = {}
+_endpoint_last_update_lock = threading.RLock()
+_endpoint_update_in_progress = {}
+_endpoint_update_in_progress_lock = threading.RLock()
+
 # Health thresholds
 HEALTH_FAILURE_THRESHOLD = 5  # consecutive failures before degraded mode
 HEALTH_RECOVERY_THRESHOLD = 3  # consecutive successes to exit degraded mode
@@ -916,12 +922,73 @@ def publish_meter_aggregates_to_mqtt(aggregates_data):
             log.debug(f"Error publishing aggregates to MQTT: {e}")
 
 
+def _async_update_endpoint(endpoint_name, pw_func, *args, jsonformat=True, **kwargs):
+    """
+    Asynchronously update endpoint cache in background thread.
+    
+    Args:
+        endpoint_name: Name of the endpoint for caching
+        pw_func: The pypowerwall function to call
+        *args: Arguments to pass to the function
+        jsonformat: Whether to return JSON formatted response
+        **kwargs: Keyword arguments to pass to the function
+    """
+    try:
+        # Mark update as in progress
+        with _endpoint_update_in_progress_lock:
+            _endpoint_update_in_progress[endpoint_name] = True
+        
+        # Fetch fresh data
+        if jsonformat:
+            result = safe_pw_call(pw_func, *args, jsonformat=True, **kwargs)
+        else:
+            result = safe_pw_call(pw_func, *args, **kwargs)
+        
+        # Update cache if successful
+        if result is not None:
+            cache_response(endpoint_name, result)
+            track_endpoint_call(endpoint_name, success=True)
+            
+            # Update last update timestamp
+            with _endpoint_last_update_lock:
+                _endpoint_last_update[endpoint_name] = time.time()
+            
+            # Publish to MQTT if this is the aggregates endpoint
+            if endpoint_name == "/aggregates" and mqtt_enabled:
+                publish_meter_aggregates_to_mqtt(result)
+            
+            if debugmode:
+                log.debug(f"Async update completed for {endpoint_name}")
+        else:
+            track_endpoint_call(endpoint_name, success=False)
+            if debugmode:
+                log.debug(f"Async update failed for {endpoint_name}")
+    
+    except Exception as e:
+        if debugmode:
+            log.debug(f"Exception in async update for {endpoint_name}: {e}")
+        track_endpoint_call(endpoint_name, success=False)
+    
+    finally:
+        # Mark update as no longer in progress
+        with _endpoint_update_in_progress_lock:
+            _endpoint_update_in_progress[endpoint_name] = False
+
+
 def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs):
     """
     Safely call a pypowerwall function for an endpoint with caching and graceful degradation.
+    
+    For /api/meters/aggregates and /api/system_status/soe endpoints:
+    - Returns cached data immediately if available and fresh (within cache_expire seconds)
+    - Triggers asynchronous background update to refresh cache
+    - Throttles updates to not occur more frequently than cache expiration time
+    
+    For other endpoints:
+    - Attempts fresh data first, falls back to cache on failure
 
     Args:
-        endpoint_name: Name of the endpoint for caching (e.g., '/aggregates')
+        endpoint_name: Name of the endpoint for caching (e.g., '/aggregates', '/soe')
         pw_func: The pypowerwall function to call
         *args: Arguments to pass to the function
         jsonformat: Whether to return JSON formatted response (default True)
@@ -930,7 +997,65 @@ def safe_endpoint_call(endpoint_name, pw_func, *args, jsonformat=True, **kwargs)
     Returns:
         Response data on success, cached data if available and fresh enough, None if no data available
     """
-    # Try to get fresh data
+    # Special handling for /aggregates and /soe endpoints
+    # Return cache immediately if available, trigger async update
+    if endpoint_name in ["/aggregates", "/soe"]:
+        current_time = time.time()
+        
+        # Check if we have cached data
+        cached_result = get_cached_response(endpoint_name)
+        
+        # Check if an update is needed (cache expired or no cache)
+        should_update = False
+        with _endpoint_last_update_lock:
+            last_update_time = _endpoint_last_update.get(endpoint_name, 0)
+            time_since_update = current_time - last_update_time
+            
+            # Throttle: only update if enough time has passed since last update
+            # Use cache_expire as the throttle interval
+            if time_since_update >= cache_expire:
+                should_update = True
+        
+        # Check if an update is already in progress
+        update_in_progress = False
+        with _endpoint_update_in_progress_lock:
+            update_in_progress = _endpoint_update_in_progress.get(endpoint_name, False)
+        
+        # Trigger async update if needed and not already in progress
+        if should_update and not update_in_progress:
+            # Start background thread to update cache
+            update_thread = threading.Thread(
+                target=_async_update_endpoint,
+                args=(endpoint_name, pw_func) + args,
+                kwargs={'jsonformat': jsonformat, **kwargs},
+                daemon=True
+            )
+            update_thread.start()
+            if debugmode:
+                log.debug(f"Triggered async update for {endpoint_name}")
+        
+        # Return cached data if available (even if stale, as we've triggered an update)
+        if cached_result is not None:
+            if debugmode:
+                log.debug(f"Returning cached data for {endpoint_name}")
+            return cached_result
+        
+        # No cache available yet - wait for the async update to complete or timeout
+        # This only happens on first call before any cache exists
+        if should_update:
+            # Wait briefly for async update to complete (max 2 seconds)
+            max_wait = min(2.0, timeout)
+            wait_start = time.time()
+            while time.time() - wait_start < max_wait:
+                time.sleep(0.1)
+                cached_result = get_cached_response(endpoint_name)
+                if cached_result is not None:
+                    return cached_result
+        
+        # Still no data available
+        return None
+    
+    # Standard behavior for other endpoints - try fresh data first
     if jsonformat:
         result = safe_pw_call(pw_func, *args, jsonformat=True, **kwargs)
     else:
